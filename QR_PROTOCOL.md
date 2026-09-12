@@ -1,52 +1,47 @@
-# QR alarm protocol and validation
+# Multiple daily QR alarms — protocol v3
 
-The ESP32 retains one alarm. The app scans a QR during setup and sends the uppercase SHA-256 hex digest of its exact UTF-8 text (no trimming or case normalization). The device stores time, enabled state and digest together under Preferences namespace `alarm`, key `configV2`. Saving enables the alarm. Legacy settings retain their time but stay disabled until a QR is associated. Replacing the alarm replaces its QR. The prior one-shot/completed behavior remains unchanged; recurrence was not added.
+## Behavior
 
-The app also provides an explicit **Stop & Clear Alarm** button. It sends `CLEAR`, stops the buzzer without a QR, erases the alarm Preferences namespace (including legacy keys), and returns `OK:CLEAR`. The app clears its time field only after acknowledgment. Reboot after clear stays disabled with no QR; the protocol uses 00:00 for the empty time. If NVS erasure fails, ringing still stops and the response is `ERR:CLEAR_STORAGE`; retry before restarting because old settings may remain.
+Up to 10 independent daily alarms live on ESP32, each with a slot ID, local hour/minute, enabled flag, QR fingerprint and name. Duplicate HH:MM is rejected even when the other alarm is disabled; both app validation and firmware reject it without modifying existing records. Each alarm can fire once per local calendar day. Dismissal does not disable it, so it repeats the next day. ON/OFF does not replay a task already completed that day. Editing its time schedules a new occurrence; editing its name/QR alone retains its daily completion history.
 
-Commands:
-- `SET:HH:MM:<64-character digest>` -> `OK:SET`
-- `STOP:<64-character digest>` -> `OK:STOP` only while ringing with a matching digest
-- `ENABLE`, `DISABLE` -> corresponding `OK:` acknowledgment
-- `GET` -> `STATE:HH:MM:<enabled>:<hasQr>:<ringing>` (flags are 0/1)
+There is one audible task at a time. If a different-time alarm becomes due while an earlier task is unfinished, it stays pending. Only the oldest pending alarm's matching QR dismisses that task, then the next pending task becomes active. Pending alarms cannot be edited, disabled or deleted. A shared QR does not dismiss all pending alarms in one scan. An unresolved alarm remains pending across midnight; no additional duplicate occurrence of that same alarm accumulates until it is dismissed.
 
-SET, ENABLE and DISABLE are rejected while ringing. Bare STOP and the old time-only SET no longer work. Serial STOP is removed. GET does not disclose the saved digest. A digest is a QR identity, not BLE client authentication; this protocol does not add pairing or replay protection.
+All ten records are written as one `configV3` value in the `alarm` Preferences namespace. Each record includes its last-triggered day and pending state, so a normal reboot does not replay a completed alarm or forget an unfinished task. Physical power-loss/NVS fault testing is still required. Persistence failures reject edits and dismissal; trigger-state persistence failures keep ringing in RAM and retry. Testing CLEAR still stops ringing without a QR and erases the alarm namespace. This is deliberately a testing bypass.
 
-For commands over 20 ASCII bytes, write `BEGIN` and read `OK:BEGIN`, then write chunks of up to 19 command characters prefixed with `+`, reading `OK:PART` each time. Write `COMMIT` and read the operation result. Transfers expire after 10 seconds between chunks and are cleared on disconnect, invalid framing or a new BEGIN. App transactions are serialized and use writes with response. Error results never count as success.
+On the first v3 boot, a valid v2 single alarm is copied into slot 0, preserving its time, enabled flag and QR. Name defaults to Alarm 1. Legacy settings without a QR are not enabled/migrated as a valid alarm. Invalid v3 storage is logged and not silently replaced from older data. Back up or inspect storage before production recovery; no physical migration has been performed by the agent.
 
-## Automated checks
+## BLE commands
 
-`tests/host/protocol_tests.cpp` includes the real firmware source with fake Arduino/BLE/RTC/NVS dependencies. It tests setup, settings reload, invalid times, missing QR, incorrect and correct dismissal, ringing mutation guards, storage failure, incomplete/expired/oversized transfers and disconnect recovery. These mocks do not validate radio timing, physical NVS power-loss behavior or camera behavior.
+Service and characteristic UUIDs remain unchanged. All responses fit the default BLE read payload. Writes over 20 bytes use BEGIN / +19-character fragments / COMMIT with acknowledgments, a 140-character command limit, and 10-second inter-fragment timeout. Disconnect and invalid transfers clear the buffer.
 
-Run with a C++17 host compiler, for example:
+- `LIST` -> `ALARMS:3:10`
+- `GET:<id>` -> `EMPTY:<id>` or `A:<id>:HH:MM:<enabled>:<state>`
+- State 0 = not pending, 1 = active audible task, 2 = waiting behind an earlier task.
+- `NAME:<id>:<chunk>` -> `N:<id>:<chunk>:<up to 12 hex characters>`; chunks 0..3, UTF-8 hex name up to 24 bytes.
+- `PUT:<id>:HH:MM:<enabled>:<hash-or-dash>:3:<name-hex>` -> `OK:PUT`. Dash keeps an existing slot's QR; a new slot requires a hash. Duplicate time -> `ERR:DUPLICATE`.
+- `ON:<id>`, `OFF:<id>`, `DEL:<id>` -> corresponding OK result. Pending target -> `ERR:RINGING`.
+- `STOP:<64-uppercase-hex SHA256 of exact UTF-8 QR>` -> `OK:STOP` only for the oldest pending task's match.
+- `CLEAR` -> `OK:CLEAR` (testing only); storage erase failure -> `ERR:CLEAR_STORAGE`.
+- `TIME:yyyyMMddHHmmss` -> `OK:TIME` after date validation and DS3231 readback (2000–2099). Phone local time is sampled just before transfer. A save is not sent if clock sync fails.
 
-```
-g++ -std=c++17 -Itests/host/stubs tests/host/protocol_tests.cpp -o protocol_tests
-./protocol_tests
-```
+Bare legacy SET/GET/ENABLE/DISABLE commands are no longer supported. Update firmware and app together. QR hashing identifies the QR; this protocol does not add BLE authentication or replay protection.
 
-In this task, the installed .NET Emscripten C++ compiler compiled the same tests to WebAssembly, executed with Node; all assertions passed.
+## App
 
-Firmware build: `platformio run` passed (RAM 12.0%, flash 87.9%). Existing locally installed RTClib/Adafruit BusIO dependencies were reused.
+The new Rise screen shows daily alarm cards, enabled toggles, next alarm, active/pending tasks, Add/Edit dialog, QR association/replacement and deletion confirmation. Device data is refreshed every 10 seconds while connected and not editing. Names are refreshed on explicit refresh/mutations. The test reset is inside a separate expandable Testing tools section. Android's enable-Bluetooth prompt/auto-connect, one connection beep, offline operation and phone clock sync remain.
 
-Android build (from app directory):
+UI uses no remote fonts/images and requires no internet. Alarm names are limited to 24 UTF-8 bytes; overlong names show an error. Duplicate saves leave the editor open so the user can choose another time. The browser preview uses the actual Razor template with fixture data and is not a live BLE session.
 
-```
-dotnet build "QR code scanner.csproj" -f net10.0-android --no-restore -p:RuntimeIdentifier=android-arm64 -v minimal
-```
+## Validation
 
-Passed and produced an ARM64 APK. Four existing CA1416 warnings remain in Android MainActivity/BluetoothPermissions. The default multi-runtime build returned failure without a compiler error; specifying ARM64 succeeded.
+- PlatformIO ESP32 build passed: RAM 12.2%, flash 88.5% at the initial v3 build.
+- Android ARM64 build passed; two preexisting CA1416 warnings remain in the unused custom BluetoothPermissions class.
+- `tests/host/protocol_tests.cpp` compiles the actual firmware with hardware stubs. Passing cases include migration, 10 slots, duplicate add/edit/disabled rejection, QR retention, names, persistence failures, pending order, reload, daily repeat, year rollover, time validation, framing, clear and connection beep.
+- `tests/ui-preview` links the actual AlarmProtocol and Razor page, checks duplicate/Unicode/invariant-format/response behavior and renders list, editor, empty and ringing states.
+- Rendered phone-width list/editor and desktop ringing state were visually checked in the in-app browser. Actual phone camera, Bluetooth delivery, 24-hour recurrence and device reboot tests are not performed by these host checks.
 
-## Physical checks still required
+Firmware build: `platformio run`. Android build from app directory: `dotnet build "QR code scanner.csproj" -f net10.0-android --no-restore -p:RuntimeIdentifier=android-arm64`.
 
-After separately approved firmware/app deployment: set an alarm with QR A, reconnect and restart the ESP32 to verify its association survives; let it ring; scan QR B and verify it keeps ringing; scan A and verify silence and acknowledgment. Try cancelling setup and dismissal, Android Back, rapid repeated detections, disconnect during save, and disabling/changing time while ringing. Repeat with a QR containing Unicode and punctuation. Check camera permission denial and Bluetooth permission behavior on the target phone.
+Host C++ test: `g++ -std=c++17 -Itests/host/stubs tests/host/protocol_tests.cpp -o protocol_tests` then run it. On this PC the installed Emscripten compiler and Node execute the same tests.
 
-The latest reset changes are integrated into both the saved PlatformIO project and saved MAUI project. Firmware and Android ARM64 builds passed, and reset tests passed for ringing, restart, legacy settings erasure, repeated clear, transfer cancellation and storage failure. This revision has not been uploaded or installed on hardware. Both the firmware and app need updating before using the reset button.
-
-## Phone clock synchronization
-
-The app sends `TIME:yyyyMMddHHmmss` using the phone's current local Gregorian date/time after connecting or refreshing, and immediately before saving an alarm (after QR scanning). The 19-byte command fits the default BLE payload. The timestamp is sampled after acquiring the BLE command lock and discovering the characteristic. Clock sync and SET use the same serialized transaction; SET is not sent if clock acknowledgment fails.
-
-Firmware validates dates in 2000–2099 including leap days, updates the DS3231 and reads it back, allowing up to one second of elapsed time. Responses: `OK:TIME`, `ERR:TIME_FORMAT`, `ERR:RTC_SYNC`. RTC reads and writes share the alarm mutex. Sync does not clear or rearm a completed alarm, change the saved QR/time, or dismiss one already ringing. Existing exact-minute trigger semantics remain: moving the clock forward past a scheduled minute does not introduce catch-up ringing.
-
-The serial monitor prints `[RTC] Synced to phone:` after success; compare this and subsequent `[ALARM] RTC=` logs with phone time. Ordinary BLE transport latency may add a small delay; this is not a precision clock synchronization protocol. Firmware and Android ARM64 builds and host protocol regression tests passed, including invalid dates, leap day, failed RTC write, corrected-time trigger and ringing/completion preservation. Physical synchronization still needs confirmation after updating both firmware and app; neither was deployed by this change.
+Physical check after separately approved deployment: verify old alarm appears in slot 0; add two distinct times and QR codes; reject a duplicate including a disabled alarm; edit a name while retaining QR; test wrong/matching dismissal; verify later pending task cannot be skipped; verify next-day repeat and same-minute reboot do not duplicate a completed task; test 10-slot limit, deletion, Bluetooth prompt and testing reset. Firmware source and tests are integrated into the saved Documents PlatformIO project. App changes are in the saved MAUI project. No firmware upload or APK installation was performed for this revision.

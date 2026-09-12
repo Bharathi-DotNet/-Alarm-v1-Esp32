@@ -9,7 +9,7 @@
 class String {
     std::string s;
 public:
-    String(const char* v=""):s(v){} String(std::string v):s(v){}
+    String(const char* v=""):s(v){} String(std::string v):s(v){} String(int v):s(std::to_string(v)){} String(uint32_t v):s(std::to_string(v)){}
     size_t length()const{return s.size();} char operator[](size_t i)const{return s[i];}
     String substring(size_t a,size_t b=std::string::npos)const{return s.substr(a,b==std::string::npos?b:b-a);}
     int toInt()const{return std::atoi(s.c_str());} const char* c_str()const{return s.c_str();}

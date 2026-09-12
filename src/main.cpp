@@ -10,51 +10,137 @@
 #define CHARACTERISTIC_UUID "abcd1234-1234-1234-1234-abcdef123456"
 RTC_DS3231 rtc;
 Preferences preferences;
+Preferences emergencyPreferences;
+String emergencyHash;
 const int buzzerPin = 23;
-int alarmHour = 7, alarmMinute = 0;
-bool alarmTriggered = false, alarmCompleted = false, alarmEnabled = false;
-String qrHash;
+const int maxAlarms = 10;
+struct Alarm {
+    bool used = false, enabled = false, ringing = false;
+    int hour = 0, minute = 0;
+    String hash, name, backup;
+    uint32_t lastDay = 0;
+};
+Alarm alarms[maxAlarms];
 SemaphoreHandle_t alarmMutex;
 String pendingCommand;
-bool receivingCommand = false;
-uint32_t lastFragment = 0;
-bool connectionBeep = false;
-uint32_t connectionBeepStarted = 0;
-bool validHash(const String &value)
-{
-    if (value.length() != 64) return false;
-    for (unsigned int i = 0; i < value.length(); ++i)
-        if (!((value[i] >= '0' && value[i] <= '9') || (value[i] >= 'A' && value[i] <= 'F'))) return false;
+bool receivingCommand = false, connectionBeep = false, storageDirty = false;
+uint32_t lastFragment = 0, connectionBeepStarted = 0;
+bool validHex(const String &s) {
+    for (unsigned int i=0;i<s.length();++i)
+        if (!((s[i]>='0'&&s[i]<='9')||(s[i]>='A'&&s[i]<='F'))) return false;
     return true;
 }
-bool validTime(const String &value)
-{
-    return value.length() == 5 && value[2] == ':' &&
-        isDigit(value[0]) && isDigit(value[1]) && isDigit(value[3]) && isDigit(value[4]) &&
-        value.substring(0, 2).toInt() < 24 && value.substring(3).toInt() < 60;
-}
-String timeText(int hour, int minute)
-{
-    char text[6];
-    snprintf(text, sizeof(text), "%02d:%02d", hour, minute);
-    return String(text);
-}
-// One NVS value commits the time, enabled flag and QR association together.
-bool saveAlarm(int hour, int minute, bool enabled, const String &hash)
-{
-    String config = timeText(hour, minute) + ":" + (enabled ? "1:" : "0:") + hash;
-    if (preferences.putString("configV2", config) != config.length()) return false;
-    alarmHour = hour;
-    alarmMinute = minute;
-    alarmEnabled = enabled;
-    qrHash = hash;
+bool validHash(const String &s) { return s.length()==64 && validHex(s); }
+bool digits(const String &s) {
+    if (!s.length()) return false;
+    for (unsigned int i=0;i<s.length();++i) if (!isDigit(s[i])) return false;
     return true;
 }
-String executeCommand(const String &command)
-{
-    if (command == "GET")
-        return "STATE:" + timeText(alarmHour, alarmMinute) + ":" +
-            (alarmEnabled ? "1:" : "0:") + (validHash(qrHash) ? "1:" : "0:") + (alarmTriggered ? "1" : "0");
+bool validName(const String &s) { return s.length()<=48 && s.length()%2==0 && validHex(s); }
+String timeText(int h,int m) { char text[6]; snprintf(text,sizeof(text),"%02d:%02d",h,m); return String(text); }
+bool validTime(const String &s) {
+    return s.length()==5 && s[2]==':' && digits(s.substring(0,2)) && digits(s.substring(3)) &&
+        s.substring(0,2).toInt()<24 && s.substring(3).toInt()<60;
+}
+int split(const String &s,char delimiter,String *parts,int capacity) {
+    int n=0,start=0;
+    for (unsigned int i=0;i<=s.length();++i) if (i==s.length()||s[i]==delimiter) {
+        if(n==capacity) return -1;
+        parts[n++]=s.substring(start,i); start=i+1;
+    }
+    return n;
+}
+int activeAlarm() {
+    int active=-1;
+    for(int i=0;i<maxAlarms;++i) if(alarms[i].used&&alarms[i].ringing) {
+        if(active<0 || alarms[i].lastDay<alarms[active].lastDay ||
+            (alarms[i].lastDay==alarms[active].lastDay &&
+             alarms[i].hour*60+alarms[i].minute<alarms[active].hour*60+alarms[active].minute)) active=i;
+    }
+    return active;
+}
+bool duplicateTime(const Alarm *items,int id,int h,int m) {
+    for(int i=0;i<maxAlarms;++i) if(i!=id&&items[i].used&&items[i].hour==h&&items[i].minute==m) return true;
+    return false;
+}
+bool persist(const Alarm *items) {
+    String config="4";
+    for(int i=0;i<maxAlarms;++i) {
+        config+="|";
+        if(!items[i].used) { config+="-"; continue; }
+        config+=timeText(items[i].hour,items[i].minute)+":"+(items[i].enabled?"1:":"0:")+
+            items[i].hash+":"+items[i].name+":"+String(items[i].lastDay)+":"+(items[i].ringing?"1":"0")+":"+items[i].backup;
+    }
+    return preferences.putString("configV4",config)==config.length();
+}
+bool commit(const Alarm *next) {
+    if(!persist(next)) return false;
+    for(int i=0;i<maxAlarms;++i) alarms[i]=next[i];
+    storageDirty=false; return true;
+}
+void loadAlarms() {
+    for(auto &alarm:alarms) alarm=Alarm();
+    storageDirty=false;
+    String config=preferences.getString("configV4","");
+    bool migrating=!config.length();
+    if(migrating) config=preferences.getString("configV3","");
+    if(config.length()) {
+        String rows[11]; Alarm loaded[maxAlarms];
+        bool valid=split(config,'|',rows,11)==11 && rows[0]==(migrating?"3":"4");
+        for(int i=0;i<maxAlarms&&valid;++i) {
+            if(rows[i+1]=="-") continue;
+            String f[8];
+            valid=split(rows[i+1],':',f,8)==(migrating?7:8) && validTime(f[0]+":"+f[1]) &&
+                (f[2]=="0"||f[2]=="1") && validHash(f[3]) && validName(f[4]) &&
+                digits(f[5]) && f[5].length()<=5 && f[5].toInt()<=47481 && (f[6]=="0"||f[6]=="1");
+            if(!migrating) valid=valid && (!f[7].length() || validHash(f[7]));
+            if(!valid) break;
+            auto &a=loaded[i]; a.used=true; a.hour=f[0].toInt(); a.minute=f[1].toInt();
+            a.enabled=f[2]=="1"; a.hash=f[3]; a.name=f[4]; a.lastDay=f[5].toInt(); a.ringing=f[6]=="1"; a.backup=migrating?String(""):f[7];
+            valid=(!a.ringing||a.enabled) && !duplicateTime(loaded,i,a.hour,a.minute);
+        }
+        if(valid) { for(int i=0;i<maxAlarms;++i) alarms[i]=loaded[i]; if(migrating) storageDirty=!persist(alarms); }
+        else Serial.println("[STORAGE] Invalid multi-alarm settings; reset or reconfigure required.");
+        return;
+    }
+    // Migrate a configured single alarm without losing its QR or enabled state.
+    String legacy=preferences.getString("configV2","");
+    if(legacy.length()==72 && validTime(legacy.substring(0,5)) && legacy[5]==':' &&
+        (legacy[6]=='0'||legacy[6]=='1') && legacy[7]==':' && validHash(legacy.substring(8))) {
+        auto &a=alarms[0]; a.used=true; a.hour=legacy.substring(0,2).toInt(); a.minute=legacy.substring(3,5).toInt();
+        a.enabled=legacy[6]=='1'; a.hash=legacy.substring(8); a.name="416C61726D2031";
+        storageDirty=!persist(alarms);
+    }
+}
+String executeCommand(const String &command) {
+    if(command=="AUTH") return validHash(emergencyHash)?"AUTH:1":"AUTH:0";
+    if(command.startsWith("PASS:")) {
+        String fields[3];
+        if(split(command,':',fields,3)!=3 || !validHash(fields[2])) return "ERR:FORMAT";
+        if(emergencyHash.length()) {
+            if(fields[1]!=emergencyHash) return "ERR:PASSWORD";
+        } else {
+            if(fields[1]!="-") return "ERR:PASSWORD";
+            if(activeAlarm()>=0) return "ERR:RINGING";
+        }
+        if(emergencyPreferences.putString("password",fields[2])!=fields[2].length()) return "ERR:STORAGE";
+        emergencyHash=fields[2]; return "OK:PASS";
+    }
+    if(command.startsWith("EMERGENCY:")) {
+        String supplied=command.substring(10);
+        if(!validHash(supplied)) return "ERR:FORMAT";
+        if(!validHash(emergencyHash)) return "ERR:NO_PASSWORD";
+        if(supplied!=emergencyHash) return "ERR:PASSWORD";
+        int active=activeAlarm();
+        if(active<0) return "ERR:NOT_RINGING";
+        Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
+        next[active].ringing=false;
+        if(!commit(next)) return "ERR:STORAGE";
+        connectionBeep=false; digitalWrite(buzzerPin,LOW);
+        return "OK:EMERGENCY";
+    }
+    if(command=="CAPS") return "CAPS:BACKUP:4";
+    if(command=="LIST") return "ALARMS:3:10";
     // Local calendar time matches the phone's local alarm time (no UTC conversion).
     if (command.startsWith("TIME:"))
     {
@@ -81,59 +167,75 @@ String executeCommand(const String &command)
             year, month, day, hour, minute, second);
         return "OK:TIME";
     }
-    // Explicit user-requested reset is allowed even while ringing, without a QR.
-    if (command == "CLEAR")
-    {
-        alarmTriggered = false;
-        alarmEnabled = false;
-        alarmCompleted = false;
-        connectionBeep = false;
-        digitalWrite(buzzerPin, LOW);
-        // Erase this alarm namespace, including legacy hour/minute/enabled keys.
-        if (!preferences.clear()) return "ERR:CLEAR_STORAGE";
-        alarmHour = 0;
-        alarmMinute = 0;
-        qrHash = "";
-        return "OK:CLEAR";
+    if(command=="CLEAR") {
+        connectionBeep=false; digitalWrite(buzzerPin,LOW);
+        for(auto &a:alarms) { a.ringing=false; a.enabled=false; }
+        if(!preferences.clear()) return "ERR:CLEAR_STORAGE";
+        for(auto &a:alarms) a=Alarm();
+        storageDirty=false; return "OK:CLEAR";
     }
-    if (command.startsWith("STOP:"))
-    {
-        String scannedHash = command.substring(5);
-        if (!validHash(scannedHash)) return "ERR:FORMAT";
-        if (!alarmTriggered) return "ERR:NOT_RINGING";
-        if (!validHash(qrHash) || scannedHash != qrHash) return "ERR:QR_MISMATCH";
-        alarmTriggered = false;
-        alarmCompleted = true;
-        connectionBeep = false;
-        digitalWrite(buzzerPin, LOW);
+    if(command.startsWith("STOP:")) {
+        String hash=command.substring(5);
+        if(!validHash(hash)) return "ERR:FORMAT";
+        int active=activeAlarm();
+        if(active<0) return "ERR:NOT_RINGING";
+        if(alarms[active].hash!=hash && alarms[active].backup!=hash) return "ERR:QR_MISMATCH";
+        Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
+        next[active].ringing=false;
+        if(!commit(next)) return "ERR:STORAGE";
+        connectionBeep=false; digitalWrite(buzzerPin,LOW);
         return "OK:STOP";
     }
-    // Changing or disabling the alarm cannot bypass QR dismissal while ringing.
-    if (command == "ENABLE" || command == "DISABLE" || command.startsWith("SET:"))
-    {
-        if (alarmTriggered) return "ERR:RINGING";
-        if (command.startsWith("SET:"))
-        {
-            if (command.length() != 74 || command[9] != ':' ||
-                !validTime(command.substring(4, 9)) || !validHash(command.substring(10))) return "ERR:FORMAT";
-            if (!saveAlarm(command.substring(4, 6).toInt(), command.substring(7, 9).toInt(),
-                           true, command.substring(10))) return "ERR:STORAGE";
-            alarmCompleted = false;
-            return "OK:SET";
-        }
-        if (!validHash(qrHash)) return "ERR:QR_REQUIRED";
-        if (!saveAlarm(alarmHour, alarmMinute, command == "ENABLE", qrHash)) return "ERR:STORAGE";
-        alarmCompleted = false;
-        return command == "ENABLE" ? "OK:ENABLE" : "OK:DISABLE";
+    String f[9]; int count=split(command,':',f,9);
+    if(count<2 || f[1].length()!=1 || !digits(f[1])) return "ERR:COMMAND";
+    int id=f[1].toInt();
+    auto &a=alarms[id];
+    if(f[0]=="BACKUP" && count==2) return a.used ? "B:"+String(id)+":"+(a.backup.length()?"1":"0") : "ERR:NOT_FOUND";
+    if(f[0]=="GET"&&count==2) {
+        if(!a.used) return "EMPTY:"+String(id);
+        int state=!a.ringing?0:(activeAlarm()==id?1:2);
+        return "A:"+String(id)+":"+timeText(a.hour,a.minute)+":"+(a.enabled?"1:":"0:")+String(state);
     }
-    return "ERR:COMMAND";
+    if(f[0]=="NAME"&&count==3) {
+        if(!a.used) return "ERR:NOT_FOUND";
+        if(f[2].length()!=1 || !digits(f[2]) || f[2].toInt()>3) return "ERR:FORMAT";
+        int chunk=f[2].toInt(),start=chunk*12;
+        return "N:"+String(id)+":"+String(chunk)+":"+(start<(int)a.name.length()?a.name.substring(start,start+12):String(""));
+    }
+    if(f[0]!="PUT"&&f[0]!="ON"&&f[0]!="OFF"&&f[0]!="DEL") return "ERR:COMMAND";
+    if(a.ringing) return "ERR:RINGING";
+    Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
+    if(f[0]=="PUT") {
+        if((count!=8 && count!=9) || !validTime(f[2]+":"+f[3]) || (f[4]!="0"&&f[4]!="1") || !validName(f[7])) return "ERR:FORMAT";
+        int hour=f[2].toInt(),minute=f[3].toInt();
+        if(duplicateTime(alarms,id,hour,minute)) return "ERR:DUPLICATE";
+        // Field 6 is reserved version token, making incompatible saves fail explicitly.
+        if(!((f[6]=="3" && count==8) || (f[6]=="4" && count==9))) return "ERR:FORMAT";
+        String backup=a.backup;
+        if(count==9 && f[8]!="-") {
+            if(f[8]!="0" && !validHash(f[8])) return "ERR:FORMAT";
+            backup=f[8]=="0"?String(""):f[8];
+        }
+        String hash=f[5]=="-"&&a.used?a.hash:f[5];
+        if(!validHash(hash)) return "ERR:QR_REQUIRED";
+        auto &n=next[id];
+        if(!a.used||a.hour!=hour||a.minute!=minute) n.lastDay=0;
+        n.used=true; n.enabled=f[4]=="1"; n.hour=hour; n.minute=minute; n.hash=hash; n.name=f[7]; n.backup=backup;
+    } else {
+        if(count!=2) return "ERR:FORMAT";
+        if(!a.used) return "ERR:NOT_FOUND";
+        if(f[0]=="DEL") next[id]=Alarm();
+        else next[id].enabled=f[0]=="ON";
+    }
+    if(!commit(next)) return "ERR:STORAGE";
+    return "OK:"+f[0];
 }
 class AlarmServerCallbacks : public BLEServerCallbacks
 {
     void onConnect(BLEServer *) override
     {
         xSemaphoreTake(alarmMutex, portMAX_DELAY);
-        if (!alarmTriggered)
+        if (activeAlarm() < 0)
         {
             connectionBeep = true;
             connectionBeepStarted = millis();
@@ -180,7 +282,7 @@ class AlarmCommandCallback : public BLECharacteristicCallbacks
                 response = executeCommand(pendingCommand);
                 pendingCommand = "";
             }
-            else if (command.length() < 2 || command.length() > 20 || pendingCommand.length() + command.length() - 1 > 74)
+            else if (command.length() < 2 || command.length() > 20 || pendingCommand.length() + command.length() - 1 > 200)
             {
                 receivingCommand = false;
                 pendingCommand = "";
@@ -200,7 +302,7 @@ class AlarmCommandCallback : public BLECharacteristicCallbacks
             response = executeCommand(command);
         }
         // Log responses only; never print QR data or fingerprints.
-        Serial.printf("[BLE] response=%s\n", response.c_str());
+        if(response!="OK:EMERGENCY") Serial.printf("[BLE] response=%s\n", response.c_str());
         characteristic->setValue(response.c_str());
         xSemaphoreGive(alarmMutex);
     }
@@ -223,23 +325,9 @@ void setup()
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     }
     preferences.begin("alarm", false);
-    String config = preferences.getString("configV2", "");
-    if (config.length() == 72 && validTime(config.substring(0, 5)) && config[5] == ':' &&
-        (config[6] == '0' || config[6] == '1') && config[7] == ':' && validHash(config.substring(8)))
-    {
-        alarmHour = config.substring(0, 2).toInt();
-        alarmMinute = config.substring(3, 5).toInt();
-        alarmEnabled = config[6] == '1';
-        qrHash = config.substring(8);
-    }
-    else
-    {
-        // Preserve the old time, but require QR setup before enabling.
-        alarmHour = preferences.getInt("hour", 0);
-        alarmMinute = preferences.getInt("minute", 0);
-        if (alarmHour < 0 || alarmHour > 23) alarmHour = 7;
-        if (alarmMinute < 0 || alarmMinute > 59) alarmMinute = 0;
-    }
+    loadAlarms();
+    emergencyPreferences.begin("alarm-auth", false);
+    emergencyHash=emergencyPreferences.getString("password", "");
     BLEDevice::init("AlarmPrototype");
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new AlarmServerCallbacks());
@@ -247,41 +335,37 @@ void setup()
     BLECharacteristic *characteristic = service->createCharacteristic(
         CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     characteristic->setCallbacks(new AlarmCommandCallback());
-    characteristic->setValue(executeCommand("GET").c_str());
+    characteristic->setValue(executeCommand("LIST").c_str());
     service->start();
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
     advertising->addServiceUUID(SERVICE_UUID);
     advertising->start();
     Serial.println("Alarm ready. Scan a QR in the app to configure.");
 }
-void loop()
-{
-    xSemaphoreTake(alarmMutex, portMAX_DELAY);
-    DateTime now = rtc.now();
-    if (alarmEnabled && validHash(qrHash) && !alarmTriggered && !alarmCompleted &&
-        now.hour() == alarmHour && now.minute() == alarmMinute)
-    {
-        alarmTriggered = true;
-        Serial.println("[ALARM] Triggered: buzzer output enabled on GPIO 23.");
+void loop() {
+    xSemaphoreTake(alarmMutex,portMAX_DELAY);
+    DateTime now=rtc.now();
+    uint32_t day=now.unixtime()/86400;
+    bool changed=false;
+    for(int i=0;i<maxAlarms;++i) {
+        auto &a=alarms[i];
+        if(a.used&&a.enabled&&!a.ringing&&day>a.lastDay&&now.hour()==a.hour&&now.minute()==a.minute) {
+            a.ringing=true; a.lastDay=day; changed=true;
+            Serial.printf("[ALARM] Due slot=%d; task pending.\n",i);
+        }
     }
-    // Diagnostic snapshot on first loop and every five seconds.
-    static bool firstDiagnostic = true;
-    static uint32_t lastDiagnostic = 0;
-    if (firstDiagnostic || millis() - lastDiagnostic >= 5000)
-    {
-        firstDiagnostic = false;
-        lastDiagnostic = millis();
-        Serial.printf("[ALARM] RTC=%02d:%02d:%02d SET=%02d:%02d enabled=%d qr=%d triggered=%d completed=%d match=%d\n",
-            now.hour(), now.minute(), now.second(), alarmHour, alarmMinute,
-            alarmEnabled, validHash(qrHash), alarmTriggered, alarmCompleted,
-            now.hour() == alarmHour && now.minute() == alarmMinute);
+    static uint32_t lastRetry=0;
+    if(changed || (storageDirty&&millis()-lastRetry>=5000)) {
+        storageDirty=!persist(alarms); lastRetry=millis();
+        if(storageDirty) Serial.println("[STORAGE] Could not persist pending state; retrying.");
     }
-    // Nonblocking updates allow an accepted QR to stop the sound immediately.
-    // Connection confirmation shares the existing buzzer without blocking BLE.
-    // Alarm ringing takes priority and cancels any pending confirmation beep.
-    if (alarmTriggered || (connectionBeep && millis() - connectionBeepStarted >= 150))
-        connectionBeep = false;
-    digitalWrite(buzzerPin, (alarmTriggered ? (millis() / 500) % 2 == 0 : connectionBeep) ? HIGH : LOW);
-    xSemaphoreGive(alarmMutex);
-    delay(20);
+    static bool first=true; static uint32_t lastLog=0;
+    if(first||millis()-lastLog>=5000) {
+        first=false;lastLog=millis();
+        Serial.printf("[ALARM] RTC=%02d:%02d:%02d active=%d\n",now.hour(),now.minute(),now.second(),activeAlarm());
+    }
+    bool ringing=activeAlarm()>=0;
+    if(ringing||(connectionBeep&&millis()-connectionBeepStarted>=150)) connectionBeep=false;
+    digitalWrite(buzzerPin,(ringing?(millis()/500)%2==0:connectionBeep)?HIGH:LOW);
+    xSemaphoreGive(alarmMutex);delay(20);
 }
