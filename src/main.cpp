@@ -6,6 +6,12 @@
 #include <BLEUtils.h>
 #include <Preferences.h>
 #include <freertos/semphr.h>
+#ifdef ARDUINO
+#include <esp_partition.h>
+#endif
+#include "alarm_audio.h"
+#include "speaker_voice.h"
+#include "music_receiver.h"
 #define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcd1234-1234-1234-1234-abcdef123456"
 RTC_DS3231 rtc;
@@ -113,6 +119,29 @@ void loadAlarms() {
     }
 }
 String executeCommand(const String &command) {
+    static String snapshot;
+    static uint32_t snapshotId=0;
+    if(command=="SNAP") {
+        snapshot=""; ++snapshotId;
+        int active=activeAlarm();
+        for(int id=0;id<maxAlarms;++id) {
+            if(id) snapshot+="|";
+            auto &a=alarms[id];
+            if(!a.used) { snapshot+="E:"+String(id); continue; }
+            snapshot+="A:"+String(id)+":"+timeText(a.hour,a.minute)+":"+(a.enabled?"1:":"0:")+
+                String(!a.ringing?0:active==id?1:2)+":"+(a.backup.length()?"1:":"0:")+a.name;
+        }
+        return "SNAP:"+String(snapshotId)+":"+String((int)((snapshot.length()+159)/160));
+    }
+    if(command.startsWith("SNAPGET:")) {
+        String fields[3];
+        if(split(command,':',fields,3)!=3 || fields[1]!=String(snapshotId) || !snapshot.length() ||
+            !digits(fields[2]) || fields[2].length()!=1) return "ERR:SNAPSHOT";
+        unsigned int page=fields[2].toInt(),offset=page*160;
+        if(offset>=snapshot.length()) return "ERR:SNAPSHOT";
+        return "S:"+String(snapshotId)+":"+String(page)+":"+snapshot.substring(offset,offset+160);
+    }
+    if(command.startsWith("AUDIO")) return AlarmAudio::command(command,activeAlarm()>=0);
     if(command=="AUTH") return validHash(emergencyHash)?"AUTH:1":"AUTH:0";
     if(command.startsWith("PASS:")) {
         String fields[3];
@@ -234,14 +263,6 @@ class AlarmServerCallbacks : public BLEServerCallbacks
 {
     void onConnect(BLEServer *) override
     {
-        xSemaphoreTake(alarmMutex, portMAX_DELAY);
-        if (activeAlarm() < 0)
-        {
-            connectionBeep = true;
-            connectionBeepStarted = millis();
-            digitalWrite(buzzerPin, HIGH);
-        }
-        xSemaphoreGive(alarmMutex);
         Serial.println("[BLE] Connected.");
     }
     void onDisconnect(BLEServer *) override
@@ -249,8 +270,17 @@ class AlarmServerCallbacks : public BLEServerCallbacks
         xSemaphoreTake(alarmMutex, portMAX_DELAY);
         pendingCommand = "";
         receivingCommand = false;
+        AlarmAudio::abort();
         xSemaphoreGive(alarmMutex);
         BLEDevice::startAdvertising();
+    }
+};
+class AudioUploadCallback : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* characteristic) override {
+        auto bytes=characteristic->getValue();
+        xSemaphoreTake(alarmMutex,portMAX_DELAY);
+        AlarmAudio::chunk((const uint8_t*)bytes.data(),bytes.size(),activeAlarm()>=0);
+        xSemaphoreGive(alarmMutex);
     }
 };
 class AlarmCommandCallback : public BLECharacteristicCallbacks
@@ -328,6 +358,8 @@ void setup()
     loadAlarms();
     emergencyPreferences.begin("alarm-auth", false);
     emergencyHash=emergencyPreferences.getString("password", "");
+    AlarmAudio::begin();
+    Serial.println(SpeakerVoice::begin()?"[VOICE] Ready: BCLK26 LRC25 DIN27.":"[VOICE] Unavailable; using connection beep.");
     BLEDevice::init("AlarmPrototype");
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new AlarmServerCallbacks());
@@ -336,10 +368,14 @@ void setup()
         CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
     characteristic->setCallbacks(new AlarmCommandCallback());
     characteristic->setValue(executeCommand("LIST").c_str());
+    BLECharacteristic* audio=service->createCharacteristic(
+        "abcd1234-1234-1234-1234-abcdef123457",BLECharacteristic::PROPERTY_WRITE);
+    audio->setCallbacks(new AudioUploadCallback());
     service->start();
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
     advertising->addServiceUUID(SERVICE_UUID);
     advertising->start();
+    MusicReceiver::begin();
     Serial.println("Alarm ready. Scan a QR in the app to configure.");
 }
 void loop() {
@@ -365,6 +401,7 @@ void loop() {
         Serial.printf("[ALARM] RTC=%02d:%02d:%02d active=%d\n",now.hour(),now.minute(),now.second(),activeAlarm());
     }
     bool ringing=activeAlarm()>=0;
+    SpeakerVoice::setAlarmActive(ringing);
     if(ringing||(connectionBeep&&millis()-connectionBeepStarted>=150)) connectionBeep=false;
     digitalWrite(buzzerPin,(ringing?(millis()/500)%2==0:connectionBeep)?HIGH:LOW);
     xSemaphoreGive(alarmMutex);delay(20);
