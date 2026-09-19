@@ -12,10 +12,15 @@
 #include "alarm_audio.h"
 #include "speaker_voice.h"
 #include "music_receiver.h"
+#include "sleep_policy.h"
+#include <atomic>
 #define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcd1234-1234-1234-1234-abcdef123456"
 RTC_DS3231 rtc;
-bool rtcAvailable = false;
+bool rtcAvailable = false, rtcTrusted=false, configHealthy=true;
+WakeTest::Policy wakePolicy;
+std::atomic<bool> linkConnected{false};
+BLEServer* testServer=nullptr;
 Preferences preferences;
 Preferences emergencyPreferences;
 Preferences missionPreferences;
@@ -88,7 +93,7 @@ bool persist(const Alarm *items) {
 bool commit(const Alarm *next) {
     if(!persist(next)) return false;
     for(int i=0;i<maxAlarms;++i) alarms[i]=next[i];
-    storageDirty=false; return true;
+    storageDirty=false; configHealthy=true; Serial.println("[STORE] Alarm transaction committed."); return true;
 }
 void loadAlarms() {
     for(auto &alarm:alarms) alarm=Alarm();
@@ -117,7 +122,7 @@ void loadAlarms() {
             valid=(!a.ringing||a.enabled) && !duplicateTime(loaded,i,a.hour,a.minute);
         }
         if(valid) { for(int i=0;i<maxAlarms;++i) alarms[i]=loaded[i]; if(migrating) storageDirty=!persist(alarms); }
-        else Serial.println("[STORAGE] Invalid multi-alarm settings; reset or reconfigure required.");
+        else { configHealthy=false; Serial.println("[STORAGE] Invalid multi-alarm settings; reset or reconfigure required."); }
         return;
     }
     // Migrate a configured single alarm without losing its QR or enabled state.
@@ -243,7 +248,7 @@ String executeCommand(const String &command) {
         if (actual < expected || actual - expected > 1) return "ERR:RTC_SYNC";
         Serial.printf("[RTC] Synced to phone: %04d-%02d-%02d %02d:%02d:%02d\n",
             year, month, day, hour, minute, second);
-        return "OK:TIME";
+        rtcTrusted=true; return "OK:TIME";
     }
     if(command=="CLEAR") {
         connectionBeep=false; writeBuzzer(LOW);
@@ -314,24 +319,31 @@ String executeCommand(const String &command) {
     if(!commit(next)) return "ERR:STORAGE";
     return "OK:"+f[0];
 }
-class AlarmServerCallbacks : public BLEServerCallbacks
-{
-    void onConnect(BLEServer *) override
-    {
-        Serial.println("[BLE] Connected.");
-        if(!SpeakerVoice::request(true)) Serial.println("[VOICE] Connect announcement skipped: alarm active or speaker unavailable.");
-    }
-    void onDisconnect(BLEServer *) override
-    {
-        xSemaphoreTake(alarmMutex, portMAX_DELAY);
-        pendingCommand = "";
-        receivingCommand = false;
-        AlarmAudio::abort();
-        xSemaphoreGive(alarmMutex);
-        BLEDevice::startAdvertising();
-        Serial.println("[BLE] Disconnected; advertising restarted.");
-        if(!SpeakerVoice::request(false)) Serial.println("[VOICE] Disconnect announcement skipped: alarm active or speaker unavailable.");
-    }
+class AlarmServerCallbacks : public BLEServerCallbacks {
+public:
+ void onConnect(BLEServer*) override {
+    linkConnected.store(true);
+    xSemaphoreTake(alarmMutex,portMAX_DELAY); wakePolicy.connect(); xSemaphoreGive(alarmMutex);
+    Serial.println("\n=======================================================");
+    Serial.println("📱 [BLE CONNECTED] MAUI App connected successfully!");
+    Serial.println("📱 [SLEEP STATUS] Sleep timer paused. ESP32 staying awake for configuration.");
+    Serial.println("=======================================================\n");
+    if(!SpeakerVoice::request(true)) Serial.println("[VOICE] Connect announcement skipped: alarm active or speaker unavailable.");
+ }
+ void onDisconnect(BLEServer*) override {
+    linkConnected.store(false);
+    xSemaphoreTake(alarmMutex,portMAX_DELAY);
+    wakePolicy.disconnect(millis()); pendingCommand=""; receivingCommand=false;
+    AlarmAudio::abort();
+    xSemaphoreGive(alarmMutex);
+    BLEDevice::startAdvertising();
+    Serial.println("\n=======================================================");
+    Serial.println("🔌 [BLE DISCONNECTED] MAUI App disconnected.");
+    Serial.println("⏳ [GRACE TIMER] 10-second grace countdown started...");
+    Serial.println("⏳ [GRACE TIMER] ESP32 will enter Deep Sleep in 10s if not reconnected.");
+    Serial.println("=======================================================\n");
+    if(!SpeakerVoice::request(false)) Serial.println("[VOICE] Disconnect announcement skipped: alarm active or speaker unavailable.");
+ }
 };
 class AudioUploadCallback : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* characteristic) override {
@@ -395,78 +407,35 @@ class AlarmCommandCallback : public BLECharacteristicCallbacks
         xSemaphoreGive(alarmMutex);
     }
 };
-void setup()
-{
-    Serial.begin(115200);
-    if (buzzerPin >= 0) pinMode(buzzerPin, OUTPUT);
-    writeBuzzer(LOW);
-    alarmMutex = xSemaphoreCreateMutex();
-    Wire.begin(21, 22); // DS3231: SDA=21, SCL=22.
-    rtcAvailable = rtc.begin();
-    if (!rtcAvailable)
-    {
-        Serial.println("[RTC] DS3231 not found. Bluetooth available; new scheduled alarms paused. Reconnect RTC and restart.");
-    }
-    if (rtcAvailable && rtc.lostPower())
-    {
-        Serial.println("[RTC] Lost power: restoring firmware compile time.");
-        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    }
-    preferences.begin("alarm", false);
-    missionPreferences.begin("mission", false);
-    loadAlarms();
-    emergencyPreferences.begin("alarm-auth", false);
-    emergencyHash=emergencyPreferences.getString("password", "");
-    AlarmAudio::begin();
-    volumePreferences.begin("volume",false);
-    int savedVolume=volumePreferences.getString("level","100").toInt();
-    AudioSamples::volumePercent.store(savedVolume>=25&&savedVolume<=100?savedVolume:100);
-    Serial.println(SpeakerVoice::begin()?"[VOICE] Ready: BCLK18 LRC19 DIN23.":"[VOICE] ERROR: speaker unavailable; no buzzer configured.");
-    BLEDevice::init("AlarmPrototype");
-    BLEServer *server = BLEDevice::createServer();
-    server->setCallbacks(new AlarmServerCallbacks());
-    BLEService *service = server->createService(SERVICE_UUID);
-    BLECharacteristic *characteristic = service->createCharacteristic(
-        CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
-    characteristic->setCallbacks(new AlarmCommandCallback());
-    characteristic->setValue(executeCommand("LIST").c_str());
-    BLECharacteristic* audio=service->createCharacteristic(
-        "abcd1234-1234-1234-1234-abcdef123457",BLECharacteristic::PROPERTY_WRITE);
-    audio->setCallbacks(new AudioUploadCallback());
-    service->start();
-    BLEAdvertising *advertising = BLEDevice::getAdvertising();
-    advertising->addServiceUUID(SERVICE_UUID);
-    advertising->start();
-    MusicReceiver::begin();
-    Serial.println("Alarm ready. Scan a QR in the app to configure.");
-}
-void loop() {
-    xSemaphoreTake(alarmMutex,portMAX_DELAY);
-    DateTime now = rtcAvailable ? rtc.now() : DateTime(2000,1,1,0,0,0);
-    uint32_t day=now.unixtime()/86400;
-    bool changed=false;
+
+void updateDue(DateTime now) {
+    bool changed=false; uint32_t day=now.unixtime()/86400;
     for(int i=0;i<maxAlarms;++i) {
         auto &a=alarms[i];
-        if(rtcAvailable&&a.used&&a.enabled&&!a.ringing&&day>a.lastDay&&now.hour()==a.hour&&now.minute()==a.minute) {
-            a.ringing=true; a.lastDay=day; changed=true;
-            Serial.printf("[ALARM] Due slot=%d; task pending.\n",i);
+        if(rtcTrusted&&a.used&&a.enabled&&!a.ringing&&day>a.lastDay&&now.hour()==a.hour&&now.minute()==a.minute) {
+            a.ringing=true;a.lastDay=day;changed=true;
+            Serial.println("\n=======================================================");
+            Serial.printf("🚨 [ALARM TRIGGERED] Slot %d is RINGING now! (%02d:%02d)\n", i, a.hour, a.minute);
+            Serial.println("🚨 [ALARM STATUS] Deep Sleep BLOCKED until QR code is scanned or dismissed.");
+            Serial.println("=======================================================\n");
         }
     }
+    if(changed) storageDirty=true;
     static uint32_t lastRetry=0;
-    if(changed || (storageDirty&&millis()-lastRetry>=5000)) {
-        storageDirty=!persist(alarms); lastRetry=millis();
-        if(storageDirty) Serial.println("[STORAGE] Could not persist pending state; retrying.");
+    if(changed || (storageDirty && uint32_t(millis()-lastRetry)>=5000)) {
+        storageDirty=!persist(alarms);lastRetry=millis();
+        Serial.println(storageDirty?"[STORE] Pending write failed; stay awake, retry.":"[STORE] Pending state saved.");
     }
-    static bool first=true; static uint32_t lastLog=0;
-    if(first||millis()-lastLog>=5000) {
-        first=false;lastLog=millis();
-        if (rtcAvailable) Serial.printf("[ALARM] RTC=%02d:%02d:%02d active=%d\n",now.hour(),now.minute(),now.second(),activeAlarm());
-        else Serial.printf("[ALARM] RTC unavailable; scheduling paused; active=%d\n",activeAlarm());
-        MusicReceiver::report();
-    }
-    bool ringing=activeAlarm()>=0;
-    SpeakerVoice::setAlarmActive(ringing);
-    if(ringing||(connectionBeep&&millis()-connectionBeepStarted>=150)) connectionBeep=false;
-    writeBuzzer((ringing?(millis()/500)%2==0:connectionBeep)?HIGH:LOW);
-    xSemaphoreGive(alarmMutex);delay(20);
+    SpeakerVoice::setAlarmActive(activeAlarm()>=0);
 }
+#ifdef ARDUINO
+#include "wake_hardware.h"
+#else
+void setup() {
+ alarmMutex=xSemaphoreCreateMutex();rtcAvailable=true;rtcTrusted=true;
+ preferences.begin("alarm",false);missionPreferences.begin("mission",false);
+ emergencyPreferences.begin("alarm-auth",false);volumePreferences.begin("volume",false);
+ loadAlarms();wakePolicy.boot(millis());
+}
+void loop() { updateDue(rtc.now()); }
+#endif
