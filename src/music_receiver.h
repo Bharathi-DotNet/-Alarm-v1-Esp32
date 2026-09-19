@@ -13,9 +13,11 @@ static void changed(bool value) {
 #include <esp_avrc_api.h>
 namespace MusicReceiver {
 static std::atomic<int> rate{44100};
+static std::atomic<uint32_t> receivedBytes{0}, outputBytes{0}, droppedBytes{0}, writeErrors{0};
 static void data(const uint8_t* bytes,uint32_t length) {
-    if(!SpeakerVoice::worker || SpeakerVoice::alarmActive.load()) return;
-    if(xSemaphoreTake(SpeakerVoice::audioMutex,0)!=pdTRUE) return;
+    receivedBytes.fetch_add(length);
+    if(!SpeakerVoice::worker || SpeakerVoice::alarmActive.load()) { droppedBytes.fetch_add(length); return; }
+    if(xSemaphoreTake(SpeakerVoice::audioMutex,0)!=pdTRUE) { droppedBytes.fetch_add(length); return; }
     if(SpeakerVoice::alarmActive.load()) {
         xSemaphoreGive(SpeakerVoice::audioMutex); return;
     }
@@ -35,16 +37,26 @@ static void data(const uint8_t* bytes,uint32_t length) {
         while(count<256 && offset+3<length) {
             int16_t left=(int16_t)(bytes[offset]|(bytes[offset+1]<<8));
             int16_t right=(int16_t)(bytes[offset+2]|(bytes[offset+3]<<8));
-            int32_t mono=((int32_t)left+right)/2;
-            block[count++]=mono*65536; block[count++]=mono*65536;
+            int32_t mono=AudioSamples::music(left,right);
+            block[count++]=mono; block[count++]=mono;
             offset+=4;
         }
-        size_t written=0;
-        if(i2s_write(SpeakerVoice::port,block,count*sizeof(int32_t),&written,pdMS_TO_TICKS(30))!=ESP_OK) break;
+        size_t sent=0, total=count*sizeof(int32_t);
+        while(sent<total) {
+            size_t written=0;
+            esp_err_t result=i2s_write(SpeakerVoice::port,reinterpret_cast<uint8_t*>(block)+sent,
+                total-sent,&written,pdMS_TO_TICKS(80));
+            sent+=written;
+            outputBytes.fetch_add(written);
+            if(result!=ESP_OK || !written) { ++writeErrors; break; }
+        }
+        if(sent!=total) break;
     }
     xSemaphoreGive(SpeakerVoice::audioMutex);
 }
 static void event(esp_a2d_cb_event_t event,esp_a2d_cb_param_t* param) {
+    if(event==ESP_A2D_AUDIO_STATE_EVT)
+        Serial.printf("[MUSIC] Audio state=%d (started=%d)\n",param->audio_stat.state,ESP_A2D_AUDIO_STATE_STARTED);
     if(event==ESP_A2D_AUDIO_CFG_EVT) {
         uint8_t frequency=param->audio_cfg.mcc.cie.sbc[0];
         rate.store(frequency&0x80?16000:frequency&0x40?32000:frequency&0x20?44100:48000);
@@ -65,7 +77,13 @@ static void begin() {
     if(result==ESP_OK) result=esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,ESP_BT_GENERAL_DISCOVERABLE);
     Serial.printf("[MUSIC] %s; pair AlarmPrototype in phone Bluetooth settings.\n",esp_err_to_name(result));
 }
+static void report() {
+    Serial.printf("[MUSIC] Last interval: received=%u output=%u dropped=%u errors=%u speaker=%s alarm=%d\n",
+        (unsigned)receivedBytes.exchange(0),(unsigned)outputBytes.exchange(0),
+        (unsigned)droppedBytes.exchange(0),(unsigned)writeErrors.exchange(0),
+        SpeakerVoice::worker?"ready":"unavailable",SpeakerVoice::alarmActive.load()?1:0);
+}
 }
 #else
-namespace MusicReceiver { inline void begin() {} }
+namespace MusicReceiver { inline void begin() {} inline void report() {} }
 #endif

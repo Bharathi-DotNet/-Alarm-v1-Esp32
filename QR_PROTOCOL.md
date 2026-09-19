@@ -1,5 +1,11 @@
 # Multiple daily QR alarms — protocol v3
 
+## Offline mission extension (2026-09-14)
+
+The current firmware also supports `MISSIONCAP` -> `MISSION:1`, `MISSION:<id>` -> `M:<id>:<revision>:<lastDay>:<state>`, and `STOPM:<id>:<revision>:<lastDay>:<hash>` -> `OK:STOPM`. These commands use the existing characteristic and fragmented write transport. `lastDay` is the RTC unix-day count. STOPM validates the exact configuration revision and occurrence; retrying an already-stopped occurrence is idempotent and cannot stop another alarm sharing its QR. Stale revisions/days are rejected. Legacy STOP remains supported.
+
+The configuration revision is appended to each v4 storage row; old v4 rows still load with revision zero and require re-saving to enable offline missions. The monotonic revision counter lives in the `mission` NVS namespace and survives the testing CLEAR command. Older firmware cannot read the extended rows; do not downgrade without a migration plan. See the MAUI project's `OFFLINE_MISSIONS.md` for app setup, Android companion association, limitations, and physical acceptance checks. No firmware was flashed by this change.
+
 ## Behavior
 
 Up to 10 independent daily alarms live on ESP32, each with a slot ID, local hour/minute, enabled flag, QR fingerprint and name. Duplicate HH:MM is rejected even when the other alarm is disabled; both app validation and firmware reject it without modifying existing records. Each alarm can fire once per local calendar day. Dismissal does not disable it, so it repeats the next day. ON/OFF does not replay a task already completed that day. Editing its time schedules a new occurrence; editing its name/QR alone retains its daily completion history.

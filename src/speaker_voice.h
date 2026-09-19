@@ -1,4 +1,5 @@
 #pragma once
+#include "audio_samples.h"
 #ifdef ARDUINO
 #include <driver/i2s.h>
 #include <atomic>
@@ -43,8 +44,8 @@ static void run(void*) {
                 for(size_t i=0;i<256;++i,++sample) {
                     uint32_t phase=sample%16000;
                     int32_t value=customBlock ? (int16_t)(pcm[2*i]|(pcm[2*i+1]<<8)) :
-                        (phase<8000 ? (int32_t)(18000.0f*sinf(2.0f*3.14159265f*(sample%16)/16.0f)) : 0);
-                    block[2*i]=block[2*i+1]=value*65536;
+                        (phase<8000 ? (int32_t)(32767.0f*sinf(2.0f*3.14159265f*(sample%16)/16.0f)) : 0);
+                    block[2*i]=block[2*i+1]=AudioSamples::volume(value*65536);
                 }
                 size_t bytes=0;
                 if(i2s_write(port,block,sizeof(block),&bytes,pdMS_TO_TICKS(250))!=ESP_OK || bytes!=sizeof(block)) {
@@ -53,12 +54,13 @@ static void run(void*) {
             }
             Serial.printf("[AUDIO] Alarm tone ended; stack free minimum=%u bytes.\n",(unsigned)uxTaskGetStackHighWaterMark(nullptr));
         } else {
+        Serial.println(voiceRequested==2?"[VOICE] Playing disconnected announcement.":"[VOICE] Playing connected announcement.");
         i2s_set_clk(port,8000,I2S_BITS_PER_SAMPLE_32BIT,I2S_CHANNEL_STEREO);
         const int8_t* voice=voiceRequested==2?disconnectionVoice:connectionVoice;
         size_t voiceLength=voiceRequested==2?sizeof(disconnectionVoice):sizeof(connectionVoice);
         for(size_t offset=0;offset<voiceLength && !alarmActive.load();offset+=256) {
             size_t n=min((size_t)256,voiceLength-offset);
-            for(size_t i=0;i<n;++i) block[2*i]=block[2*i+1]=(int32_t)voice[offset+i]*16777216;
+            for(size_t i=0;i<n;++i) block[2*i]=block[2*i+1]=AudioSamples::voice(voice[offset+i]);
             size_t bytes=0;
             if(i2s_write(port,block,n*8,&bytes,pdMS_TO_TICKS(250))!=ESP_OK || bytes!=n*8) { failed=true; break; }
         }
@@ -82,7 +84,7 @@ static bool begin() {
     cfg.dma_buf_count=4; cfg.dma_buf_len=256; cfg.tx_desc_auto_clear=true;
     if(i2s_driver_install(port,&cfg,0,nullptr)!=ESP_OK) return false;
     i2s_pin_config_t pins={}; pins.mck_io_num=I2S_PIN_NO_CHANGE;
-    pins.bck_io_num=26; pins.ws_io_num=25; pins.data_out_num=27; pins.data_in_num=I2S_PIN_NO_CHANGE;
+    pins.bck_io_num=18; pins.ws_io_num=19; pins.data_out_num=23; pins.data_in_num=I2S_PIN_NO_CHANGE;
     if(i2s_set_pin(port,&pins)!=ESP_OK) { i2s_driver_uninstall(port); return false; }
     i2s_zero_dma_buffer(port);
     if(xTaskCreate(run,"connection-voice",12288,nullptr,1,&worker)!=pdPASS) { worker=nullptr; i2s_driver_uninstall(port); return false; }

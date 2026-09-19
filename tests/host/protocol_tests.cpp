@@ -11,11 +11,27 @@ String put(int id,const char* time,String qr=hash,const char* name="4D6F726E696E
 void clockAt(const char* value){assert(send(String("TIME:")+value)=="OK:TIME");}
 int main(){
     setup();assert(send("LIST")=="ALARMS:3:10");assert(send("GET:0")=="EMPTY:0");
+    assert(send("VOLUME")=="VOLUME:100");
+    assert(send("VOLUME:50")=="OK:VOLUME");
+    assert(volumePreferences.values["level"]=="50");
+    AudioSamples::volumePercent.store(100); setup();
+    assert(send("VOLUME")=="VOLUME:50");
+    assert(send("VOLUME:0")=="ERR:VOLUME");
+    assert(send("VOLUME:101")=="ERR:VOLUME");
+    assert(send("VOLUME:abc")=="ERR:VOLUME");
+    volumePreferences.fail=true;
+    assert(send("VOLUME:75")=="ERR:STORAGE");
+    assert(send("VOLUME")=="VOLUME:50");
+    volumePreferences.fail=false;
+    alarms[0].used=true; alarms[0].ringing=true;
+    assert(send("VOLUME:25")=="ERR:RINGING");
+    alarms[0]=Alarm();
+    assert(send("VOLUME:100")=="OK:VOLUME");
     preferences.values["configV2"]=String("07:00:1:")+hash;
     loadAlarms();assert(alarms[0].used&&alarms[0].enabled&&alarms[0].hash==hash);
-    assert(send("GET:0")=="A:0:07:00:1:0");assert(preferences.values.count("configV3"));
-    assert(send("OFF:0")=="OK:OFF");auto saved=preferences.values["configV3"];
-    assert(put(1,"07:00")=="ERR:DUPLICATE");assert(!alarms[1].used&&preferences.values["configV3"]==saved);
+    assert(send("GET:0")=="A:0:07:00:1:0");assert(preferences.values.count("configV4"));
+    assert(send("OFF:0")=="OK:OFF");auto saved=preferences.values["configV4"];
+    assert(put(1,"07:00")=="ERR:DUPLICATE");assert(!alarms[1].used&&preferences.values["configV4"]==saved);
     assert(put(1,"08:00",wrong)=="OK:PUT");assert(put(1,"07:00")=="ERR:DUPLICATE");assert(alarms[1].hour==8);
     assert(put(1,"08:10","-","E0AEAEE0AEBE")=="OK:PUT");assert(alarms[1].hash==wrong);
     assert(send("NAME:1:0")=="N:1:0:E0AEAEE0AEBE");assert(send("NAME:1:1")=="N:1:1:");
@@ -24,8 +40,8 @@ int main(){
     assert(transfer(String("PUT:10:20:00:1:")+hash+":3:")=="ERR:COMMAND");
     assert(put(9,"24:00")=="ERR:FORMAT");assert(put(9,"17:60")=="ERR:FORMAT");
     assert(put(9,"17:00",hash,"XYZ")=="ERR:FORMAT");
-    saved=preferences.values["configV3"];preferences.fail=true;
-    assert(send("DEL:1")=="ERR:STORAGE");assert(alarms[1].used&&preferences.values["configV3"]==saved);preferences.fail=false;
+    saved=preferences.values["configV4"];preferences.fail=true;
+    assert(send("DEL:1")=="ERR:STORAGE");assert(alarms[1].used&&preferences.values["configV4"]==saved);preferences.fail=false;
     loadAlarms();assert(alarms[1].hour==8&&alarms[1].minute==10&&alarms[1].hash==wrong);
     assert(send("DEL:9")=="OK:DEL");assert(put(9,"19:00")=="OK:PUT");
     assert(send("CLEAR")=="OK:CLEAR");loadAlarms();assert(!alarms[0].used);
@@ -54,7 +70,14 @@ int main(){
     send("BEGIN");fakeMillis+=10001;assert(send("+PUT:")=="ERR:TRANSFER");
     send("BEGIN");assert(send(String("+")+std::string(20,'A'))=="ERR:FORMAT");
     send("BEGIN");send("+PUT:0:");static_cast<BLEServerCallbacks&>(server).onDisconnect(nullptr);assert(send("COMMIT")=="ERR:TRANSFER");
-    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(connectionBeep&&buzzerValue==HIGH);fakeMillis+=151;loop();assert(!connectionBeep&&buzzerValue==LOW);
+    loop(); // Publish cleared alarm state to the audio worker before announcing.
+    auto voiceRequests=SpeakerVoice::requests;
+    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+1);
+    static_cast<BLEServerCallbacks&>(server).onDisconnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+2);
+    SpeakerVoice::setAlarmActive(true);
+    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+2);
+    SpeakerVoice::setAlarmActive(false);
+    fakeMillis+=151;loop();assert(!connectionBeep&&buzzerValue==LOW);
     send("CLEAR");assert(preferences.values.empty());
-    std::cout<<"PASS: migration, 10 slots, duplicate add/edit/disabled rejection, QR retention, UTF8 names, atomic failures, pending order, persistence, daily repeat, year rollover, clock validation, framing, clear and connection beep\n";
+    std::cout<<"PASS: migration, 10 slots, duplicate add/edit/disabled rejection, QR retention, UTF8 names, atomic failures, pending order, persistence, daily repeat, year rollover, clock validation, framing, clear and BLE connection voice with alarm priority\n";
 }

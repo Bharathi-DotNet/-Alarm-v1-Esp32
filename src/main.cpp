@@ -15,16 +15,22 @@
 #define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
 #define CHARACTERISTIC_UUID "abcd1234-1234-1234-1234-abcdef123456"
 RTC_DS3231 rtc;
+bool rtcAvailable = false;
 Preferences preferences;
 Preferences emergencyPreferences;
+Preferences missionPreferences;
+Preferences volumePreferences;
 String emergencyHash;
-const int buzzerPin = 23;
+// GPIO23 is now amplifier DIN; the separate legacy buzzer is disabled.
+const int buzzerPin = -1;
+void writeBuzzer(int value) { if (buzzerPin >= 0) digitalWrite(buzzerPin, value); }
 const int maxAlarms = 10;
 struct Alarm {
     bool used = false, enabled = false, ringing = false;
     int hour = 0, minute = 0;
     String hash, name, backup;
     uint32_t lastDay = 0;
+    uint32_t revision = 0;
 };
 Alarm alarms[maxAlarms];
 SemaphoreHandle_t alarmMutex;
@@ -75,7 +81,7 @@ bool persist(const Alarm *items) {
         config+="|";
         if(!items[i].used) { config+="-"; continue; }
         config+=timeText(items[i].hour,items[i].minute)+":"+(items[i].enabled?"1:":"0:")+
-            items[i].hash+":"+items[i].name+":"+String(items[i].lastDay)+":"+(items[i].ringing?"1":"0")+":"+items[i].backup;
+            items[i].hash+":"+items[i].name+":"+String(items[i].lastDay)+":"+(items[i].ringing?"1":"0")+":"+items[i].backup+":"+String(items[i].revision);
     }
     return preferences.putString("configV4",config)==config.length();
 }
@@ -95,14 +101,19 @@ void loadAlarms() {
         bool valid=split(config,'|',rows,11)==11 && rows[0]==(migrating?"3":"4");
         for(int i=0;i<maxAlarms&&valid;++i) {
             if(rows[i+1]=="-") continue;
-            String f[8];
-            valid=split(rows[i+1],':',f,8)==(migrating?7:8) && validTime(f[0]+":"+f[1]) &&
+            String f[9]; int fields=split(rows[i+1],':',f,9);
+            valid=(migrating?fields==7:(fields==8||fields==9)) && validTime(f[0]+":"+f[1]) &&
                 (f[2]=="0"||f[2]=="1") && validHash(f[3]) && validName(f[4]) &&
                 digits(f[5]) && f[5].length()<=5 && f[5].toInt()<=47481 && (f[6]=="0"||f[6]=="1");
             if(!migrating) valid=valid && (!f[7].length() || validHash(f[7]));
             if(!valid) break;
             auto &a=loaded[i]; a.used=true; a.hour=f[0].toInt(); a.minute=f[1].toInt();
             a.enabled=f[2]=="1"; a.hash=f[3]; a.name=f[4]; a.lastDay=f[5].toInt(); a.ringing=f[6]=="1"; a.backup=migrating?String(""):f[7];
+            if(fields==9) {
+                valid=digits(f[8]) && f[8].length()<=9;
+                if(!valid) break;
+                a.revision=f[8].toInt();
+            }
             valid=(!a.ringing||a.enabled) && !duplicateTime(loaded,i,a.hour,a.minute);
         }
         if(valid) { for(int i=0;i<maxAlarms;++i) alarms[i]=loaded[i]; if(migrating) storageDirty=!persist(alarms); }
@@ -119,6 +130,43 @@ void loadAlarms() {
     }
 }
 String executeCommand(const String &command) {
+    if(command=="VOLUME") return "VOLUME:"+String(AudioSamples::volumePercent.load());
+    if(command.startsWith("VOLUME:")) {
+        String text=command.substring(7);
+        if(!digits(text)||text.length()>3||text.toInt()<25||text.toInt()>100) return "ERR:VOLUME";
+        if(activeAlarm()>=0) return "ERR:RINGING";
+        int value=text.toInt();
+        if(value!=AudioSamples::volumePercent.load()) {
+            String saved=String(value);
+            if(volumePreferences.putString("level",saved)!=saved.length()) return "ERR:STORAGE";
+            AudioSamples::volumePercent.store(value);
+        }
+        return "OK:VOLUME";
+    }
+    if(command=="MISSIONCAP") return "MISSION:1";
+    if(command.startsWith("MISSION:")) {
+        String idText=command.substring(8);
+        if(idText.length()!=1||!digits(idText)) return "ERR:FORMAT";
+        int id=idText.toInt(); auto &a=alarms[id];
+        if(!a.used) return "ERR:NOT_FOUND";
+        return "M:"+String(id)+":"+String(a.revision)+":"+String(a.lastDay)+":"+String(!a.ringing?0:activeAlarm()==id?1:2);
+    }
+    if(command.startsWith("STOPM:")) {
+        String f[5];
+        if(split(command,':',f,5)!=5||f[1].length()!=1||!digits(f[1])||
+           !digits(f[2])||f[2].length()>9||!digits(f[3])||f[3].length()>5||!validHash(f[4])) return "ERR:FORMAT";
+        int id=f[1].toInt(); auto &a=alarms[id];
+        if(!a.used||a.revision==0||f[2]!=String(a.revision)||f[3]!=String(a.lastDay)||a.lastDay==0) return "ERR:STALE_MISSION";
+        if(a.hash!=f[4]&&a.backup!=f[4]) return "ERR:QR_MISMATCH";
+        // Same occurrence already persisted as stopped: safely acknowledge a lost reply.
+        if(!a.ringing) return "OK:STOPM";
+        if(activeAlarm()!=id) return "ERR:MISSION_WAITING";
+        Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
+        next[id].ringing=false;
+        if(!commit(next)) return "ERR:STORAGE";
+        connectionBeep=false; writeBuzzer(LOW);
+        return "OK:STOPM";
+    }
     static String snapshot;
     static uint32_t snapshotId=0;
     if(command=="SNAP") {
@@ -165,7 +213,7 @@ String executeCommand(const String &command) {
         Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
         next[active].ringing=false;
         if(!commit(next)) return "ERR:STORAGE";
-        connectionBeep=false; digitalWrite(buzzerPin,LOW);
+        connectionBeep=false; writeBuzzer(LOW);
         return "OK:EMERGENCY";
     }
     if(command=="CAPS") return "CAPS:BACKUP:4";
@@ -188,6 +236,7 @@ String executeCommand(const String &command) {
         int maxDay = days[month - 1] + (month == 2 && year % 4 == 0 ? 1 : 0);
         if (day < 1 || day > maxDay) return "ERR:TIME_FORMAT";
         DateTime target(year, month, day, hour, minute, second);
+        if (!rtcAvailable) return "ERR:RTC_SYNC";
         rtc.adjust(target);
         uint32_t actual = rtc.now().unixtime();
         uint32_t expected = target.unixtime();
@@ -197,7 +246,7 @@ String executeCommand(const String &command) {
         return "OK:TIME";
     }
     if(command=="CLEAR") {
-        connectionBeep=false; digitalWrite(buzzerPin,LOW);
+        connectionBeep=false; writeBuzzer(LOW);
         for(auto &a:alarms) { a.ringing=false; a.enabled=false; }
         if(!preferences.clear()) return "ERR:CLEAR_STORAGE";
         for(auto &a:alarms) a=Alarm();
@@ -212,7 +261,7 @@ String executeCommand(const String &command) {
         Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
         next[active].ringing=false;
         if(!commit(next)) return "ERR:STORAGE";
-        connectionBeep=false; digitalWrite(buzzerPin,LOW);
+        connectionBeep=false; writeBuzzer(LOW);
         return "OK:STOP";
     }
     String f[9]; int count=split(command,':',f,9);
@@ -250,6 +299,12 @@ String executeCommand(const String &command) {
         auto &n=next[id];
         if(!a.used||a.hour!=hour||a.minute!=minute) n.lastDay=0;
         n.used=true; n.enabled=f[4]=="1"; n.hour=hour; n.minute=minute; n.hash=hash; n.name=f[7]; n.backup=backup;
+        // Allocate before the atomic alarm save. Gaps are safe; reused revisions are not.
+        uint32_t revision=missionPreferences.getString("revision","0").toInt()+1;
+        if(revision>999999999) return "ERR:STORAGE";
+        String revisionText=String(revision);
+        if(missionPreferences.putString("revision",revisionText)!=revisionText.length()) return "ERR:STORAGE";
+        n.revision=revision;
     } else {
         if(count!=2) return "ERR:FORMAT";
         if(!a.used) return "ERR:NOT_FOUND";
@@ -264,6 +319,7 @@ class AlarmServerCallbacks : public BLEServerCallbacks
     void onConnect(BLEServer *) override
     {
         Serial.println("[BLE] Connected.");
+        if(!SpeakerVoice::request(true)) Serial.println("[VOICE] Connect announcement skipped: alarm active or speaker unavailable.");
     }
     void onDisconnect(BLEServer *) override
     {
@@ -273,6 +329,8 @@ class AlarmServerCallbacks : public BLEServerCallbacks
         AlarmAudio::abort();
         xSemaphoreGive(alarmMutex);
         BLEDevice::startAdvertising();
+        Serial.println("[BLE] Disconnected; advertising restarted.");
+        if(!SpeakerVoice::request(false)) Serial.println("[VOICE] Disconnect announcement skipped: alarm active or speaker unavailable.");
     }
 };
 class AudioUploadCallback : public BLECharacteristicCallbacks {
@@ -340,26 +398,30 @@ class AlarmCommandCallback : public BLECharacteristicCallbacks
 void setup()
 {
     Serial.begin(115200);
-    pinMode(buzzerPin, OUTPUT);
-    digitalWrite(buzzerPin, LOW);
+    if (buzzerPin >= 0) pinMode(buzzerPin, OUTPUT);
+    writeBuzzer(LOW);
     alarmMutex = xSemaphoreCreateMutex();
-    Wire.begin(21, 22);
-    if (!rtc.begin())
+    Wire.begin(21, 22); // DS3231: SDA=21, SCL=22.
+    rtcAvailable = rtc.begin();
+    if (!rtcAvailable)
     {
-        Serial.println("DS3231 NOT FOUND!");
-        while (true) delay(1000);
+        Serial.println("[RTC] DS3231 not found. Bluetooth available; new scheduled alarms paused. Reconnect RTC and restart.");
     }
-    if (rtc.lostPower())
+    if (rtcAvailable && rtc.lostPower())
     {
         Serial.println("[RTC] Lost power: restoring firmware compile time.");
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     }
     preferences.begin("alarm", false);
+    missionPreferences.begin("mission", false);
     loadAlarms();
     emergencyPreferences.begin("alarm-auth", false);
     emergencyHash=emergencyPreferences.getString("password", "");
     AlarmAudio::begin();
-    Serial.println(SpeakerVoice::begin()?"[VOICE] Ready: BCLK26 LRC25 DIN27.":"[VOICE] Unavailable; using connection beep.");
+    volumePreferences.begin("volume",false);
+    int savedVolume=volumePreferences.getString("level","100").toInt();
+    AudioSamples::volumePercent.store(savedVolume>=25&&savedVolume<=100?savedVolume:100);
+    Serial.println(SpeakerVoice::begin()?"[VOICE] Ready: BCLK18 LRC19 DIN23.":"[VOICE] ERROR: speaker unavailable; no buzzer configured.");
     BLEDevice::init("AlarmPrototype");
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new AlarmServerCallbacks());
@@ -380,12 +442,12 @@ void setup()
 }
 void loop() {
     xSemaphoreTake(alarmMutex,portMAX_DELAY);
-    DateTime now=rtc.now();
+    DateTime now = rtcAvailable ? rtc.now() : DateTime(2000,1,1,0,0,0);
     uint32_t day=now.unixtime()/86400;
     bool changed=false;
     for(int i=0;i<maxAlarms;++i) {
         auto &a=alarms[i];
-        if(a.used&&a.enabled&&!a.ringing&&day>a.lastDay&&now.hour()==a.hour&&now.minute()==a.minute) {
+        if(rtcAvailable&&a.used&&a.enabled&&!a.ringing&&day>a.lastDay&&now.hour()==a.hour&&now.minute()==a.minute) {
             a.ringing=true; a.lastDay=day; changed=true;
             Serial.printf("[ALARM] Due slot=%d; task pending.\n",i);
         }
@@ -398,11 +460,13 @@ void loop() {
     static bool first=true; static uint32_t lastLog=0;
     if(first||millis()-lastLog>=5000) {
         first=false;lastLog=millis();
-        Serial.printf("[ALARM] RTC=%02d:%02d:%02d active=%d\n",now.hour(),now.minute(),now.second(),activeAlarm());
+        if (rtcAvailable) Serial.printf("[ALARM] RTC=%02d:%02d:%02d active=%d\n",now.hour(),now.minute(),now.second(),activeAlarm());
+        else Serial.printf("[ALARM] RTC unavailable; scheduling paused; active=%d\n",activeAlarm());
+        MusicReceiver::report();
     }
     bool ringing=activeAlarm()>=0;
     SpeakerVoice::setAlarmActive(ringing);
     if(ringing||(connectionBeep&&millis()-connectionBeepStarted>=150)) connectionBeep=false;
-    digitalWrite(buzzerPin,(ringing?(millis()/500)%2==0:connectionBeep)?HIGH:LOW);
+    writeBuzzer((ringing?(millis()/500)%2==0:connectionBeep)?HIGH:LOW);
     xSemaphoreGive(alarmMutex);delay(20);
 }
