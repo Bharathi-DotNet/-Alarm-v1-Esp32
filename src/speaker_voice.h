@@ -9,7 +9,9 @@ namespace SpeakerVoice {
 static TaskHandle_t worker=nullptr;
 static SemaphoreHandle_t audioMutex=nullptr;
 static std::atomic<bool> alarmActive{false};
+static std::atomic<bool> isPlaying{false};
 static std::atomic<int> pendingAnnouncement{0};
+static uint32_t lastAnnouncementAt=0;
 static void setAlarmActive(bool value) { alarmActive.store(value); }
 static const i2s_port_t port=I2S_NUM_1;
 static void run(void*) {
@@ -18,6 +20,7 @@ static void run(void*) {
         int voiceRequested=pendingAnnouncement.exchange(0);
         if(!alarmActive.load() && !voiceRequested) continue;
         xSemaphoreTake(audioMutex,portMAX_DELAY);
+        isPlaying.store(true);
         static int32_t block[256*2];
         bool failed=false;
         if(alarmActive.load()) {
@@ -54,21 +57,22 @@ static void run(void*) {
             }
             Serial.printf("[AUDIO] Alarm tone ended; stack free minimum=%u bytes.\n",(unsigned)uxTaskGetStackHighWaterMark(nullptr));
         } else {
-        Serial.println(voiceRequested==2?"[VOICE] Playing disconnected announcement.":"[VOICE] Playing connected announcement.");
-        i2s_set_clk(port,8000,I2S_BITS_PER_SAMPLE_32BIT,I2S_CHANNEL_STEREO);
-        const int8_t* voice=voiceRequested==2?disconnectionVoice:connectionVoice;
-        size_t voiceLength=voiceRequested==2?sizeof(disconnectionVoice):sizeof(connectionVoice);
-        for(size_t offset=0;offset<voiceLength && !alarmActive.load();offset+=256) {
-            size_t n=min((size_t)256,voiceLength-offset);
-            for(size_t i=0;i<n;++i) block[2*i]=block[2*i+1]=AudioSamples::voice(voice[offset+i]);
-            size_t bytes=0;
-            if(i2s_write(port,block,n*8,&bytes,pdMS_TO_TICKS(250))!=ESP_OK || bytes!=n*8) { failed=true; break; }
-        }
+            Serial.println(voiceRequested==2?"[VOICE] Playing disconnected announcement.":"[VOICE] Playing connected announcement.");
+            i2s_set_clk(port,8000,I2S_BITS_PER_SAMPLE_32BIT,I2S_CHANNEL_STEREO);
+            const int8_t* voice=voiceRequested==2?disconnectionVoice:connectionVoice;
+            size_t voiceLength=voiceRequested==2?sizeof(disconnectionVoice):sizeof(connectionVoice);
+            for(size_t offset=0;offset<voiceLength && !alarmActive.load();offset+=256) {
+                size_t n=min((size_t)256,voiceLength-offset);
+                for(size_t i=0;i<n;++i) block[2*i]=block[2*i+1]=AudioSamples::voice(voice[offset+i]);
+                size_t bytes=0;
+                if(i2s_write(port,block,n*8,&bytes,pdMS_TO_TICKS(250))!=ESP_OK || bytes!=n*8) { failed=true; break; }
+            }
         }
         // Flush the tail with silence without repeating the last DMA samples.
         memset(block,0,sizeof(block));
         for(int i=0;i<5;++i) { size_t bytes=0; i2s_write(port,block,sizeof(block),&bytes,pdMS_TO_TICKS(250)); }
         i2s_zero_dma_buffer(port);
+        isPlaying.store(false);
         xSemaphoreGive(audioMutex);
         if(failed) Serial.println("[VOICE] Audio write failed.");
     }
@@ -90,7 +94,17 @@ static bool begin() {
     if(xTaskCreate(run,"connection-voice",12288,nullptr,1,&worker)!=pdPASS) { worker=nullptr; i2s_driver_uninstall(port); return false; }
     return true;
 }
-static bool request(bool connected=true) { if(!worker || alarmActive.load()) return false; pendingAnnouncement.store(connected?1:2); xTaskNotifyGive(worker); return true; }
+static bool request(bool connected=true) {
+    if(!worker || alarmActive.load()) return false;
+    uint32_t now=millis();
+    if(isPlaying.load() || (uint32_t)(now-lastAnnouncementAt)<3500) {
+        return true; // Already playing or recently requested: ignore duplicate
+    }
+    lastAnnouncementAt=now;
+    pendingAnnouncement.store(connected?1:2);
+    xTaskNotifyGive(worker);
+    return true;
+}
 }
 #else
 // Host tests exercise routing and fallback; real I2S is validated by the ESP32 build/device.

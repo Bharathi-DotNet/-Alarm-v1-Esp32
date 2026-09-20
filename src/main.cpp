@@ -38,6 +38,7 @@ struct Alarm {
     uint32_t revision = 0;
 };
 Alarm alarms[maxAlarms];
+uint32_t snoozeUntil[maxAlarms] = {0};
 SemaphoreHandle_t alarmMutex;
 String pendingCommand;
 bool receivingCommand = false, connectionBeep = false, storageDirty = false;
@@ -143,8 +144,10 @@ String executeCommand(const String &command) {
         int value=text.toInt();
         if(value!=AudioSamples::volumePercent.load()) {
             String saved=String(value);
+            volumePreferences.begin("volume", false);
             if(volumePreferences.putString("level",saved)!=saved.length()) return "ERR:STORAGE";
             AudioSamples::volumePercent.store(value);
+            Serial.printf("[VOLUME] Saved volume: %d%%\n", value);
         }
         return "OK:VOLUME";
     }
@@ -168,6 +171,7 @@ String executeCommand(const String &command) {
         if(activeAlarm()!=id) return "ERR:MISSION_WAITING";
         Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
         next[id].ringing=false;
+        snoozeUntil[id]=0;
         if(!commit(next)) return "ERR:STORAGE";
         connectionBeep=false; writeBuzzer(LOW);
         return "OK:STOPM";
@@ -181,8 +185,9 @@ String executeCommand(const String &command) {
             if(id) snapshot+="|";
             auto &a=alarms[id];
             if(!a.used) { snapshot+="E:"+String(id); continue; }
+            int st = !a.ringing ? 0 : (snoozeUntil[id] != 0 && rtcAvailable && rtc.now().unixtime() < snoozeUntil[id]) ? 2 : (active==id ? 1 : 2);
             snapshot+="A:"+String(id)+":"+timeText(a.hour,a.minute)+":"+(a.enabled?"1:":"0:")+
-                String(!a.ringing?0:active==id?1:2)+":"+(a.backup.length()?"1:":"0:")+a.name;
+                String(st)+":"+(a.backup.length()?"1:":"0:")+a.name;
         }
         return "SNAP:"+String(snapshotId)+":"+String((int)((snapshot.length()+159)/160));
     }
@@ -217,6 +222,7 @@ String executeCommand(const String &command) {
         if(active<0) return "ERR:NOT_RINGING";
         Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
         next[active].ringing=false;
+        snoozeUntil[active]=0;
         if(!commit(next)) return "ERR:STORAGE";
         connectionBeep=false; writeBuzzer(LOW);
         return "OK:EMERGENCY";
@@ -252,10 +258,27 @@ String executeCommand(const String &command) {
     }
     if(command=="CLEAR") {
         connectionBeep=false; writeBuzzer(LOW);
+        for(auto &s:snoozeUntil) s=0;
         for(auto &a:alarms) { a.ringing=false; a.enabled=false; }
         if(!preferences.clear()) return "ERR:CLEAR_STORAGE";
         for(auto &a:alarms) a=Alarm();
         storageDirty=false; return "OK:CLEAR";
+    }
+    if(command=="SNOOZE" || command.startsWith("SNOOZE:")) {
+        int active=activeAlarm();
+        if(active<0) return "ERR:NOT_RINGING";
+        int mins=5;
+        if(command.startsWith("SNOOZE:")) {
+            String mText=command.substring(7);
+            if(digits(mText) && mText.toInt()>=1 && mText.toInt()<=60) mins=mText.toInt();
+            else return "ERR:FORMAT";
+        }
+        uint32_t nowSec=rtcAvailable ? rtc.now().unixtime() : 0;
+        snoozeUntil[active]=nowSec + mins*60;
+        connectionBeep=false; writeBuzzer(LOW);
+        SpeakerVoice::setAlarmActive(false);
+        Serial.printf("[SNOOZE] Alarm %d snoozed for %d minutes.\n", active, mins);
+        return "OK:SNOOZE";
     }
     if(command.startsWith("STOP:")) {
         String hash=command.substring(5);
@@ -265,6 +288,7 @@ String executeCommand(const String &command) {
         if(alarms[active].hash!=hash && alarms[active].backup!=hash) return "ERR:QR_MISMATCH";
         Alarm next[maxAlarms]; for(int i=0;i<maxAlarms;++i) next[i]=alarms[i];
         next[active].ringing=false;
+        snoozeUntil[active]=0;
         if(!commit(next)) return "ERR:STORAGE";
         connectionBeep=false; writeBuzzer(LOW);
         return "OK:STOP";
@@ -276,7 +300,7 @@ String executeCommand(const String &command) {
     if(f[0]=="BACKUP" && count==2) return a.used ? "B:"+String(id)+":"+(a.backup.length()?"1":"0") : "ERR:NOT_FOUND";
     if(f[0]=="GET"&&count==2) {
         if(!a.used) return "EMPTY:"+String(id);
-        int state=!a.ringing?0:(activeAlarm()==id?1:2);
+        int state=!a.ringing?0:(snoozeUntil[id]!=0&&rtcAvailable&&rtc.now().unixtime()<snoozeUntil[id])?2:(activeAlarm()==id?1:2);
         return "A:"+String(id)+":"+timeText(a.hour,a.minute)+":"+(a.enabled?"1:":"0:")+String(state);
     }
     if(f[0]=="NAME"&&count==3) {
@@ -328,6 +352,7 @@ public:
     Serial.println("📱 [BLE CONNECTED] MAUI App connected successfully!");
     Serial.println("📱 [SLEEP STATUS] Sleep timer paused. ESP32 staying awake for configuration.");
     Serial.println("=======================================================\n");
+    MusicReceiver::connectLastDevice();
     if(!SpeakerVoice::request(true)) Serial.println("[VOICE] Connect announcement skipped: alarm active or speaker unavailable.");
  }
  void onDisconnect(BLEServer*) override {
@@ -426,7 +451,14 @@ void updateDue(DateTime now) {
         storageDirty=!persist(alarms);lastRetry=millis();
         Serial.println(storageDirty?"[STORE] Pending write failed; stay awake, retry.":"[STORE] Pending state saved.");
     }
-    SpeakerVoice::setAlarmActive(activeAlarm()>=0);
+    int active = activeAlarm();
+    uint32_t nowSec = now.unixtime();
+    if(active >= 0 && snoozeUntil[active] != 0 && nowSec >= snoozeUntil[active]) {
+        snoozeUntil[active] = 0;
+        Serial.printf("[SNOOZE] Alarm %d snooze expired. Ringing resumes!\n", active);
+    }
+    bool shouldSound = active >= 0 && (snoozeUntil[active] == 0 || nowSec >= snoozeUntil[active]);
+    SpeakerVoice::setAlarmActive(shouldSound);
 }
 #ifdef ARDUINO
 #include "wake_hardware.h"

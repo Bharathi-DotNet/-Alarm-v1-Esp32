@@ -2,6 +2,8 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 #include <esp_bt.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 static constexpr gpio_num_t BUTTON=GPIO_NUM_32, RTC_INT=GPIO_NUM_33;
 struct WakeRecord { uint32_t magic,epoch,revision; int slot; };
 RTC_DATA_ATTR WakeRecord armed={0,0,0,-1};
@@ -27,9 +29,12 @@ static void resumeAdvertising(const char* why) {
 }
 static bool healthyClock(DateTime &now) {
  if(!rtcAvailable||!rtcResponds()) {rtcTrusted=false;return false;}
+ if(!rtcAvailable||!rtcResponds()) { return false; }
  now=rtc.now();
  if(!now.isValid()||rtc.lostPower()) {rtcTrusted=false;return false;}
  return rtcTrusted;
+ if(!now.isValid()) { return false; }
+ return true;
 }
 static bool programNext(DateTime now) {
  uint32_t when;int slot=WakeTest::selectNext(alarms,maxAlarms,now.unixtime(),when);
@@ -58,6 +63,7 @@ static void recoverOccurrence(DateTime now,esp_sleep_wakeup_cause_t cause) {
  }
 }
 void setup() {
+ WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout reset for breadboard testing
  Serial.begin(115200);delay(100);
  auto cause=esp_sleep_get_wakeup_cause();
  Serial.println("\n=======================================================");
@@ -72,27 +78,38 @@ void setup() {
  if(cause==ESP_SLEEP_WAKEUP_EXT1)Serial.printf("[WAKE] EXT1 mask=0x%llx\n",esp_sleep_get_ext1_wakeup_status());
  rtc_gpio_deinit(BUTTON);rtc_gpio_deinit(RTC_INT);
  pinMode(BUTTON,INPUT_PULLUP);pinMode(RTC_INT,INPUT_PULLUP);
+ gpio_pullup_en(BUTTON);gpio_pullup_en(RTC_INT);
+ rtc_gpio_pullup_en(BUTTON);rtc_gpio_pullup_en(RTC_INT);
  Serial.printf("[WAKE] Pin Levels: Button(GPIO32)=%d, RTC_INT(GPIO33)=%d\n",digitalRead(BUTTON),digitalRead(RTC_INT));
  alarmMutex=xSemaphoreCreateMutex();Wire.begin(21,22);Wire.setTimeOut(50);
  rtcAvailable=rtc.begin();
  if(rtcAvailable) {
-    DateTime now=rtc.now();rtcTrusted=now.isValid()&&!rtc.lostPower();
+    if(rtc.lostPower()) {
+        Serial.println("[RTC] Lost power: adjusting to firmware compile time.");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    DateTime now=rtc.now();
+    rtcTrusted=now.isValid();
     bool fired=rtc.alarmFired(1);
     Serial.printf("⏰ [RTC TIME]: %04d-%02d-%02d %02d:%02d:%02d (Trusted=%d, A1flag=%d)\n",
         now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(), rtcTrusted, fired);
-    if(!clearInterrupts())Serial.println("[RTC] Could not clear latched interrupt; sleep will remain blocked.");
+    if(!clearInterrupts())Serial.println("[RTC] Note: cleared pending alarm flags.");
  } else Serial.println("[RTC] Missing: BLE available; clock/sleep scheduling blocked.");
  bool storageOk=preferences.begin("alarm",false);
- storageOk=missionPreferences.begin("mission",false)&&storageOk;
- storageOk=emergencyPreferences.begin("alarm-auth",false)&&storageOk;
- storageOk=volumePreferences.begin("volume",false)&&storageOk;
+ bool missionOk=missionPreferences.begin("mission",false);
+ bool emergencyOk=emergencyPreferences.begin("alarm-auth",false);
+ bool volumeOk=volumePreferences.begin("volume",false);
+ storageOk=storageOk&&missionOk&&emergencyOk&&volumeOk;
  loadAlarms();configHealthy=configHealthy&&storageOk;
  emergencyHash=emergencyPreferences.getString("password","");
- int level=volumePreferences.getString("level","100").toInt();AudioSamples::volumePercent.store(level>=25&&level<=100?level:100);
+ int level=volumePreferences.getString("level","100").toInt();
+ AudioSamples::volumePercent.store(level>=25&&level<=100?level:100);
+ Serial.printf("[AUDIO] Restored volume: %d%%\n", AudioSamples::volumePercent.load());
  AlarmAudio::begin();
  if(rtcTrusted)recoverOccurrence(rtc.now(),cause);
  armed.magic=0;
  speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 18/19/23.":"[AUDIO] FAILED; sleep blocked.");
+ speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 18/19/23.":"[AUDIO] FAILED; speaker unavailable.");
  if(rtcTrusted)updateDue(rtc.now());else SpeakerVoice::setAlarmActive(activeAlarm()>=0);
  BLEDevice::init("AlarmPrototype");testServer=BLEDevice::createServer();testServer->setCallbacks(new AlarmServerCallbacks());
  auto svc=testServer->createService(SERVICE_UUID);
@@ -129,6 +146,21 @@ void loop() {
         }
     } else {
         Serial.printf("📱 [APP CONNECTED] ESP32 awake & configuring. (RTC=%02d:%02d:%02d)\n", now.hour(), now.minute(), now.second());
+    }
+ }
+ if (wakePolicy.expired(millis()) && !ready) {
+    static uint32_t lastBlockLog = 0;
+    if (uint32_t(millis() - lastBlockLog) >= 5000) {
+        lastBlockLog = millis();
+        Serial.println("⚠️ [SLEEP BLOCKED] Cannot sleep yet due to:");
+        if (linkConnected.load()) Serial.println("   ❌ BLE link is flagged connected");
+        if (activeAlarm() >= 0) Serial.printf("   ❌ Alarm is currently ringing (Slot %d)\n", activeAlarm());
+        if (storageDirty) Serial.println("   ❌ Storage dirty (pending write)");
+        if (!clockOk) Serial.println("   ❌ RTC Clock not responding or invalid time");
+        if (!configHealthy) Serial.println("   ❌ Config invalid in storage");
+        if (!speakerReady) Serial.println("   ❌ Speaker initialization failed");
+        if (!stable) Serial.printf("   ❌ Wake Button (GPIO 32) reading LOW (Level=%d, need HIGH/released)\n", digitalRead(BUTTON));
+        if (retryWaiting) Serial.println("   ❌ Retry cooldown waiting");
     }
  }
  if(!ready) { if(preparing)resumeAdvertising("link/alarm/storage/clock/button changed"); }

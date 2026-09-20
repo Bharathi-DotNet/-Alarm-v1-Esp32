@@ -1,4 +1,6 @@
 #pragma once
+#include <Preferences.h>
+
 namespace MediaVoice {
 static bool connected=false;
 static void changed(bool value) {
@@ -14,11 +16,33 @@ static void changed(bool value) {
 namespace MusicReceiver {
 static std::atomic<int> rate{44100};
 static std::atomic<uint32_t> receivedBytes{0}, outputBytes{0}, droppedBytes{0}, writeErrors{0};
+static Preferences btPrefs;
+static esp_bd_addr_t lastBda = {0};
+static bool hasLastBda = false;
+static std::atomic<bool> a2dpReady{false};
+
+static bool connectLastDevice() {
+    if (!a2dpReady.load()) return false;
+    if (!hasLastBda) {
+        btPrefs.begin("bt-audio", true);
+        size_t len = btPrefs.getBytes("last_bda", lastBda, sizeof(lastBda));
+        btPrefs.end();
+        hasLastBda = (len == sizeof(lastBda));
+    }
+    if (hasLastBda) {
+        Serial.printf("[MUSIC] Auto-connecting A2DP audio to phone: %02X:%02X:%02X:%02X:%02X:%02X\n",
+            lastBda[0], lastBda[1], lastBda[2], lastBda[3], lastBda[4], lastBda[5]);
+        esp_err_t res = esp_a2d_sink_connect(lastBda);
+        return (res == ESP_OK);
+    }
+    return false;
+}
+
 static void data(const uint8_t* bytes,uint32_t length) {
     receivedBytes.fetch_add(length);
-    if(!SpeakerVoice::worker || SpeakerVoice::alarmActive.load()) { droppedBytes.fetch_add(length); return; }
+    if(!SpeakerVoice::worker || SpeakerVoice::alarmActive.load() || SpeakerVoice::isPlaying.load()) { droppedBytes.fetch_add(length); return; }
     if(xSemaphoreTake(SpeakerVoice::audioMutex,0)!=pdTRUE) { droppedBytes.fetch_add(length); return; }
-    if(SpeakerVoice::alarmActive.load()) {
+    if(SpeakerVoice::alarmActive.load() || SpeakerVoice::isPlaying.load()) {
         xSemaphoreGive(SpeakerVoice::audioMutex); return;
     }
     static int currentRate=0;
@@ -32,7 +56,7 @@ static void data(const uint8_t* bytes,uint32_t length) {
         currentRate=requested;
     }
     int32_t block[256];
-    for(uint32_t offset=0;offset+3<length && !SpeakerVoice::alarmActive.load();) {
+    for(uint32_t offset=0;offset+3<length && !SpeakerVoice::alarmActive.load() && !SpeakerVoice::isPlaying.load();) {
         size_t count=0;
         while(count<256 && offset+3<length) {
             int16_t left=(int16_t)(bytes[offset]|(bytes[offset+1]<<8));
@@ -55,6 +79,13 @@ static void data(const uint8_t* bytes,uint32_t length) {
     xSemaphoreGive(SpeakerVoice::audioMutex);
 }
 static void event(esp_a2d_cb_event_t event,esp_a2d_cb_param_t* param) {
+    if(event==ESP_A2D_PROF_STATE_EVT) {
+        if(param->a2d_prof_stat.init_state==ESP_A2D_INIT_SUCCESS) {
+            a2dpReady.store(true);
+            Serial.println("[MUSIC] A2DP sink initialized; attempting auto-reconnect...");
+            connectLastDevice();
+        }
+    }
     if(event==ESP_A2D_AUDIO_STATE_EVT)
         Serial.printf("[MUSIC] Audio state=%d (started=%d)\n",param->audio_stat.state,ESP_A2D_AUDIO_STATE_STARTED);
     if(event==ESP_A2D_AUDIO_CFG_EVT) {
@@ -66,6 +97,20 @@ static void event(esp_a2d_cb_event_t event,esp_a2d_cb_param_t* param) {
         Serial.printf("[MUSIC] Connection state=%d\n",param->conn_stat.state);
         if(param->conn_stat.state==ESP_A2D_CONNECTION_STATE_CONNECTED) MediaVoice::changed(true);
         else if(param->conn_stat.state==ESP_A2D_CONNECTION_STATE_DISCONNECTED) MediaVoice::changed(false);
+        if(param->conn_stat.state==ESP_A2D_CONNECTION_STATE_CONNECTED) {
+            MediaVoice::changed(true);
+            // Save the phone's MAC address so ESP32 can auto-reconnect A2DP
+            memcpy(lastBda, param->conn_stat.remote_bda, sizeof(esp_bd_addr_t));
+            hasLastBda = true;
+            btPrefs.begin("bt-audio", false);
+            btPrefs.putBytes("last_bda", lastBda, sizeof(lastBda));
+            btPrefs.end();
+            Serial.printf("[MUSIC] Saved phone MAC for auto-reconnect: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                lastBda[0], lastBda[1], lastBda[2], lastBda[3], lastBda[4], lastBda[5]);
+        }
+        else if(param->conn_stat.state==ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            MediaVoice::changed(false);
+        }
     }
 }
 static void begin() {
@@ -86,4 +131,9 @@ static void report() {
 }
 #else
 namespace MusicReceiver { inline void begin() {} inline void report() {} }
+namespace MusicReceiver {
+inline void begin() {}
+inline void report() {}
+inline bool connectLastDevice() { return false; }
+}
 #endif
