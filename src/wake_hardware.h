@@ -109,7 +109,6 @@ void setup() {
  if(rtcTrusted)recoverOccurrence(rtc.now(),cause);
  armed.magic=0;
  speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 18/19/23.":"[AUDIO] FAILED; sleep blocked.");
- speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 18/19/23.":"[AUDIO] FAILED; speaker unavailable.");
  if(rtcTrusted)updateDue(rtc.now());else SpeakerVoice::setAlarmActive(activeAlarm()>=0);
  BLEDevice::init("AlarmPrototype");testServer=BLEDevice::createServer();testServer->setCallbacks(new AlarmServerCallbacks());
  auto svc=testServer->createService(SERVICE_UUID);

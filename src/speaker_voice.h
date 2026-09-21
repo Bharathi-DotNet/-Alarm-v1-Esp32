@@ -78,6 +78,7 @@ static void run(void*) {
     }
 }
 static bool begin() {
+    if(worker != nullptr) return true;
     audioMutex=xSemaphoreCreateMutex();
     if(!audioMutex) return false;
     i2s_config_t cfg={};
