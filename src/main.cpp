@@ -353,7 +353,7 @@ public:
     Serial.println("📱 [SLEEP STATUS] Sleep timer paused. ESP32 staying awake for configuration.");
     Serial.println("=======================================================\n");
     MusicReceiver::connectLastDevice();
-    if(!SpeakerVoice::request(true)) Serial.println("[VOICE] Connect announcement skipped: alarm active or speaker unavailable.");
+    // Production: silent connect (no voice announcement)
  }
  void onDisconnect(BLEServer*) override {
     linkConnected.store(false);
@@ -367,7 +367,7 @@ public:
     Serial.println("⏳ [GRACE TIMER] 10-second grace countdown started...");
     Serial.println("⏳ [GRACE TIMER] ESP32 will enter Deep Sleep in 10s if not reconnected.");
     Serial.println("=======================================================\n");
-    if(!SpeakerVoice::request(false)) Serial.println("[VOICE] Disconnect announcement skipped: alarm active or speaker unavailable.");
+    // Production: silent disconnect (no voice announcement)
  }
 };
 class AudioUploadCallback : public BLECharacteristicCallbacks {

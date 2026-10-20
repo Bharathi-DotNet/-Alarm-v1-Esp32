@@ -6,7 +6,7 @@ static bool connected=false;
 static void changed(bool value) {
     if(connected==value) return;
     connected=value;
-    SpeakerVoice::request(value);
+    // Production: silent media connection state change
 }
 }
 #ifdef ARDUINO

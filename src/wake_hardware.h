@@ -109,15 +109,7 @@ void setup() {
  if(rtcTrusted)recoverOccurrence(rtc.now(),cause);
  armed.magic=0;
  speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 25/26/33.":"[AUDIO] FAILED; sleep blocked.");
- if(speakerReady) {
-     Serial.println("🔊 [AUDIO TEST] Step 1: Playing 3-second alarm tone on GPIO 25/26/33...");
-     SpeakerVoice::playTestTone(3000);
-     delay(400);
-     Serial.println("🔊 [AUDIO TEST] Step 2: Playing voice announcement...");
-     SpeakerVoice::request(true);
-     delay(1800);
-     Serial.println("🔊 [AUDIO TEST] Boot sound test completed.");
- }
+
  if(rtcTrusted)updateDue(rtc.now());else SpeakerVoice::setAlarmActive(activeAlarm()>=0);
  BLEDevice::init("AlarmPrototype");testServer=BLEDevice::createServer();testServer->setCallbacks(new AlarmServerCallbacks());
  auto svc=testServer->createService(SERVICE_UUID);
@@ -129,24 +121,11 @@ void setup() {
  auto adv=BLEDevice::getAdvertising();adv->addServiceUUID(SERVICE_UUID);wakePolicy.boot(millis());adv->start();
  MusicReceiver::begin();
  Serial.println("📡 [BLE ADVERTISING] Device Name: AlarmPrototype");
- Serial.println("🔊 [AUDIO COMMANDS] Type 't' in Serial Monitor for alarm tone, 'v' for voice!");
  Serial.println("⏳ [FALLBACK TIMER] 120s (2 minutes) countdown started. Will sleep if no app connects.");
  Serial.println("=======================================================\n");
 }
 void loop() {
- if (Serial.available()) {
-     char cmd = Serial.read();
-     if (cmd == 't' || cmd == 'T') {
-         Serial.println("\n🔊 [TEST] Serial command: Playing 3-second alarm tone...");
-         wakePolicy.boot(millis());
-         SpeakerVoice::playTestTone(3000);
-     } else if (cmd == 'v' || cmd == 'V') {
-         Serial.println("\n🔊 [TEST] Serial command: Playing voice announcement...");
-         wakePolicy.boot(millis());
-         SpeakerVoice::request(true);
-     }
- }
- xSemaphoreTake(alarmMutex,portMAX_DELAY);
+  xSemaphoreTake(alarmMutex,portMAX_DELAY);
  DateTime now(2000,1,1,0,0,0);bool clockOk=healthyClock(now);
  if(clockOk)updateDue(now);else SpeakerVoice::setAlarmActive(activeAlarm()>=0);
  bool released=digitalRead(BUTTON)==HIGH;

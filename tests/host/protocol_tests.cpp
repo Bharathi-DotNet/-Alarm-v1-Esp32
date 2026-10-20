@@ -72,10 +72,10 @@ int main(){
     send("BEGIN");send("+PUT:0:");static_cast<BLEServerCallbacks&>(server).onDisconnect(nullptr);assert(send("COMMIT")=="ERR:TRANSFER");
     loop(); // Publish cleared alarm state to the audio worker before announcing.
     auto voiceRequests=SpeakerVoice::requests;
-    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+1);
-    static_cast<BLEServerCallbacks&>(server).onDisconnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+2);
+    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests);
+    static_cast<BLEServerCallbacks&>(server).onDisconnect(nullptr);assert(SpeakerVoice::requests==voiceRequests);
     SpeakerVoice::setAlarmActive(true);
-    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests+2);
+    static_cast<BLEServerCallbacks&>(server).onConnect(nullptr);assert(SpeakerVoice::requests==voiceRequests);
     SpeakerVoice::setAlarmActive(false);
     fakeMillis+=151;loop();assert(!connectionBeep&&buzzerValue==LOW);
     send("CLEAR");assert(preferences.values.empty());
