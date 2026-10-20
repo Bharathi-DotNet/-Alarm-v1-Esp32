@@ -26,7 +26,7 @@ Preferences emergencyPreferences;
 Preferences missionPreferences;
 Preferences volumePreferences;
 String emergencyHash;
-// GPIO23 is now amplifier DIN; the separate legacy buzzer is disabled.
+// GPIO27 is now amplifier DIN; the separate legacy buzzer is disabled.
 const int buzzerPin = -1;
 void writeBuzzer(int value) { if (buzzerPin >= 0) digitalWrite(buzzerPin, value); }
 const int maxAlarms = 10;
@@ -467,7 +467,11 @@ void setup() {
  alarmMutex=xSemaphoreCreateMutex();rtcAvailable=true;rtcTrusted=true;
  preferences.begin("alarm",false);missionPreferences.begin("mission",false);
  emergencyPreferences.begin("alarm-auth",false);volumePreferences.begin("volume",false);
- loadAlarms();wakePolicy.boot(millis());
+ loadAlarms();
+ emergencyHash=emergencyPreferences.getString("password","");
+ int level=volumePreferences.getString("level","100").toInt();
+ AudioSamples::volumePercent.store(level>=25&&level<=100?level:100);
+ wakePolicy.boot(millis());
 }
 void loop() { updateDue(rtc.now()); }
 #endif

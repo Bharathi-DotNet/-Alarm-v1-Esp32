@@ -89,7 +89,7 @@ static bool begin() {
     cfg.dma_buf_count=4; cfg.dma_buf_len=256; cfg.tx_desc_auto_clear=true;
     if(i2s_driver_install(port,&cfg,0,nullptr)!=ESP_OK) return false;
     i2s_pin_config_t pins={}; pins.mck_io_num=I2S_PIN_NO_CHANGE;
-    pins.bck_io_num=18; pins.ws_io_num=19; pins.data_out_num=23; pins.data_in_num=I2S_PIN_NO_CHANGE;
+    pins.bck_io_num=25; pins.ws_io_num=26; pins.data_out_num=33; pins.data_in_num=I2S_PIN_NO_CHANGE;
     if(i2s_set_pin(port,&pins)!=ESP_OK) { i2s_driver_uninstall(port); return false; }
     i2s_zero_dma_buffer(port);
     if(xTaskCreate(run,"connection-voice",12288,nullptr,1,&worker)!=pdPASS) { worker=nullptr; i2s_driver_uninstall(port); return false; }
@@ -106,12 +106,20 @@ static bool request(bool connected=true) {
     xTaskNotifyGive(worker);
     return true;
 }
+static void playTestTone(uint32_t durationMs = 800) {
+    if(!worker) return;
+    setAlarmActive(true);
+    xTaskNotifyGive(worker);
+    delay(durationMs);
+    setAlarmActive(false);
+}
 }
 #else
 // Host tests exercise routing and fallback; real I2S is validated by the ESP32 build/device.
 namespace SpeakerVoice {
 inline bool alarmActive=false;
 inline void setAlarmActive(bool value) { alarmActive=value; }
+inline void playTestTone(uint32_t = 800) {}
 inline bool available=true;
 inline int requests=0;
 inline bool begin(){return available;}

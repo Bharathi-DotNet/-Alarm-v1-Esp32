@@ -4,7 +4,7 @@
 #include <esp_bt.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-static constexpr gpio_num_t BUTTON=GPIO_NUM_32, RTC_INT=GPIO_NUM_33;
+static constexpr gpio_num_t BUTTON=GPIO_NUM_32, RTC_INT=GPIO_NUM_27;
 struct WakeRecord { uint32_t magic,epoch,revision; int slot; };
 RTC_DATA_ATTR WakeRecord armed={0,0,0,-1};
 static bool preparing=false, speakerReady=false;
@@ -80,7 +80,7 @@ void setup() {
  pinMode(BUTTON,INPUT_PULLUP);pinMode(RTC_INT,INPUT_PULLUP);
  gpio_pullup_en(BUTTON);gpio_pullup_en(RTC_INT);
  rtc_gpio_pullup_en(BUTTON);rtc_gpio_pullup_en(RTC_INT);
- Serial.printf("[WAKE] Pin Levels: Button(GPIO32)=%d, RTC_INT(GPIO33)=%d\n",digitalRead(BUTTON),digitalRead(RTC_INT));
+ Serial.printf("[WAKE] Pin Levels: Button(GPIO32)=%d, RTC_INT(GPIO27)=%d\n",digitalRead(BUTTON),digitalRead(RTC_INT));
  alarmMutex=xSemaphoreCreateMutex();Wire.begin(21,22);Wire.setTimeOut(50);
  rtcAvailable=rtc.begin();
  if(rtcAvailable) {
@@ -108,7 +108,16 @@ void setup() {
  AlarmAudio::begin();
  if(rtcTrusted)recoverOccurrence(rtc.now(),cause);
  armed.magic=0;
- speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 18/19/23.":"[AUDIO] FAILED; sleep blocked.");
+ speakerReady=SpeakerVoice::begin();Serial.println(speakerReady?"[AUDIO] Ready: 25/26/33.":"[AUDIO] FAILED; sleep blocked.");
+ if(speakerReady) {
+     Serial.println("🔊 [AUDIO TEST] Step 1: Playing 3-second alarm tone on GPIO 25/26/33...");
+     SpeakerVoice::playTestTone(3000);
+     delay(400);
+     Serial.println("🔊 [AUDIO TEST] Step 2: Playing voice announcement...");
+     SpeakerVoice::request(true);
+     delay(1800);
+     Serial.println("🔊 [AUDIO TEST] Boot sound test completed.");
+ }
  if(rtcTrusted)updateDue(rtc.now());else SpeakerVoice::setAlarmActive(activeAlarm()>=0);
  BLEDevice::init("AlarmPrototype");testServer=BLEDevice::createServer();testServer->setCallbacks(new AlarmServerCallbacks());
  auto svc=testServer->createService(SERVICE_UUID);
@@ -120,10 +129,23 @@ void setup() {
  auto adv=BLEDevice::getAdvertising();adv->addServiceUUID(SERVICE_UUID);wakePolicy.boot(millis());adv->start();
  MusicReceiver::begin();
  Serial.println("📡 [BLE ADVERTISING] Device Name: AlarmPrototype");
+ Serial.println("🔊 [AUDIO COMMANDS] Type 't' in Serial Monitor for alarm tone, 'v' for voice!");
  Serial.println("⏳ [FALLBACK TIMER] 120s (2 minutes) countdown started. Will sleep if no app connects.");
  Serial.println("=======================================================\n");
 }
 void loop() {
+ if (Serial.available()) {
+     char cmd = Serial.read();
+     if (cmd == 't' || cmd == 'T') {
+         Serial.println("\n🔊 [TEST] Serial command: Playing 3-second alarm tone...");
+         wakePolicy.boot(millis());
+         SpeakerVoice::playTestTone(3000);
+     } else if (cmd == 'v' || cmd == 'V') {
+         Serial.println("\n🔊 [TEST] Serial command: Playing voice announcement...");
+         wakePolicy.boot(millis());
+         SpeakerVoice::request(true);
+     }
+ }
  xSemaphoreTake(alarmMutex,portMAX_DELAY);
  DateTime now(2000,1,1,0,0,0);bool clockOk=healthyClock(now);
  if(clockOk)updateDue(now);else SpeakerVoice::setAlarmActive(activeAlarm()>=0);

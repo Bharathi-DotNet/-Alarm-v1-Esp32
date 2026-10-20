@@ -130,7 +130,6 @@ static void report() {
 }
 }
 #else
-namespace MusicReceiver { inline void begin() {} inline void report() {} }
 namespace MusicReceiver {
 inline void begin() {}
 inline void report() {}
